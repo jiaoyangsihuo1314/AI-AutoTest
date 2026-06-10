@@ -1,0 +1,10 @@
+node_modules/
+.venv/
+frontend/node_modules/
+frontend/dist/
+backend/*.sqlite
+playwright-report/
+test-results/
+artifacts/
+tests/e2e/.live-runs/
+tests/e2e/.draft-runs/
