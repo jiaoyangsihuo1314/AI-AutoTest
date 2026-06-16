@@ -12,7 +12,10 @@ import {
   CircleDot,
   ClipboardList,
   Code2,
+  Copy,
   Database,
+  Eye,
+  EyeOff,
   ExternalLink,
   FileCheck2,
   FileText,
@@ -21,6 +24,7 @@ import {
   History,
   LayoutDashboard,
   LogOut,
+  Lock,
   MoreHorizontal,
   MonitorPlay,
   Palette,
@@ -49,13 +53,28 @@ import {
   Maximize2,
   Search,
   Trash2,
+  UserCog,
   X,
 } from 'lucide-react';
 import './styles.css';
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8001';
+function defaultApiBase() {
+  if (typeof window === 'undefined') return 'http://127.0.0.1:8001';
+  return `${window.location.protocol}//${window.location.hostname}:8001`;
+}
+
+const API_BASE = import.meta.env.VITE_API_BASE || defaultApiBase();
 const WS_BASE = API_BASE.replace(/^http/, 'ws');
 const THEME_STORAGE_KEY = 'qa-platform-theme';
+const DEFAULT_AI_BASE_URL = 'https://api.openai.com/v1';
+const DEFAULT_AI_MODEL = 'gpt-4.1-mini';
+const AI_PROVIDER_OPTIONS = [
+  { value: 'openai', label: 'OpenAI' },
+  { value: 'gpt', label: 'GPT 网关' },
+  { value: 'anthropic', label: 'Anthropic' },
+  { value: 'deepseek', label: 'DeepSeek' },
+  { value: 'custom', label: '自定义' },
+];
 const THEMES = [
   {
     id: 'deep-sea',
@@ -179,8 +198,9 @@ const MODULES = [
   { id: 'delivery', label: '交付报告', icon: FileText },
   { id: 'projects', label: '项目管理', icon: Database },
   { id: 'case-management', label: '用例管理', icon: Table2 },
-  { id: 'feature-menus', label: '功能菜单配置', icon: FolderTree },
+  { id: 'feature-menus', label: '功能菜单配置', navLabel: '功能模块配置', icon: FolderTree },
   { id: 'ai-config', label: 'AI 配置', icon: Settings },
+  { id: 'user-management', label: '用户管理', icon: UserCog },
 ];
 
 const HOME_MODULE_ID = 'overview';
@@ -189,9 +209,38 @@ const NAV_GROUPS = [
   { id: 'workspace', title: '工作台', icon: LayoutDashboard, moduleIds: ['overview', 'automation-flow', 'test-suites', 'execution-monitor'] },
   { id: 'workflow', title: '测试任务流', icon: ClipboardList, moduleIds: ['requirements', 'cases', 'exploration', 'scripts', 'execution', 'healing'] },
   { id: 'assets', title: '资产管理', icon: Database, moduleIds: ['projects', 'case-management', 'delivery'] },
-  { id: 'settings', title: '系统设置', icon: Settings, moduleIds: ['feature-menus', 'ai-config'] },
+  { id: 'settings', title: '系统设置', icon: Settings, moduleIds: ['feature-menus', 'ai-config', 'user-management'] },
 ];
 const MODULE_GROUP_LOOKUP = Object.fromEntries(NAV_GROUPS.flatMap((group) => group.moduleIds.map((moduleId) => [moduleId, group.id])));
+const ROLE_LABELS = {
+  admin: '管理员',
+  lead: '测试负责人',
+  executor: '测试执行者',
+  viewer: '只读访客',
+};
+const STATUS_LABELS = {
+  pending: '待审核',
+  active: '已启用',
+  disabled: '已禁用',
+};
+const MODULE_ROLE_ACCESS = {
+  overview: ['admin', 'lead', 'executor', 'viewer'],
+  'test-suites': ['admin', 'lead', 'executor', 'viewer'],
+  'execution-monitor': ['admin', 'lead', 'executor', 'viewer'],
+  requirements: ['admin', 'lead', 'executor', 'viewer'],
+  cases: ['admin', 'lead', 'executor', 'viewer'],
+  exploration: ['admin', 'lead', 'executor', 'viewer'],
+  scripts: ['admin', 'lead', 'executor', 'viewer'],
+  execution: ['admin', 'lead', 'executor', 'viewer'],
+  healing: ['admin', 'lead', 'executor', 'viewer'],
+  delivery: ['admin', 'lead', 'executor', 'viewer'],
+  projects: ['admin', 'lead', 'viewer'],
+  'case-management': ['admin', 'lead', 'executor', 'viewer'],
+  'automation-flow': ['admin', 'lead', 'executor', 'viewer'],
+  'feature-menus': ['admin', 'lead'],
+  'ai-config': ['admin'],
+  'user-management': ['admin'],
+};
 
 const FLOW = ['需求分析', '项目预检', '用例设计', '页面探索', '脚本实现', '运行验证', '自愈诊断', '保存已验证产物'];
 const AUTOMATION_FLOW_STAGES = FLOW;
@@ -227,6 +276,9 @@ function formatDetailedLogTime(value = new Date()) {
 function statusLabel(status) {
   return {
     draft: '草稿',
+    verified: '已验证',
+    active: '生效中',
+    archived: '已归档',
     explored: '已探索',
     'explored-draft': '探索待确认',
     exploring: '探索中',
@@ -247,6 +299,66 @@ function statusLabel(status) {
     blocked: '阻塞',
     completed: '已完成',
   }[status] || status;
+}
+
+function assetModeLabel(mode) {
+  return {
+    create: '新建',
+    refresh: '刷新替换',
+    append: '追加',
+  }[mode] || mode || '新建';
+}
+
+function aiProviderLabel(provider) {
+  return AI_PROVIDER_OPTIONS.find((item) => item.value === provider)?.label || '自定义';
+}
+
+function emptyAIConfig() {
+  return {
+    id: '',
+    name: '',
+    provider: 'openai',
+    api_key: '',
+    model: DEFAULT_AI_MODEL,
+    base_url: DEFAULT_AI_BASE_URL,
+  };
+}
+
+function aiProfileToForm(profile) {
+  if (!profile) return emptyAIConfig();
+  return {
+    id: profile.id || '',
+    name: profile.name || '',
+    provider: profile.provider || 'openai',
+    api_key: '',
+    model: profile.model || DEFAULT_AI_MODEL,
+    base_url: profile.baseUrl || DEFAULT_AI_BASE_URL,
+  };
+}
+
+async function writeClipboardText(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // Fall through to the legacy copy path for restricted browser contexts.
+    }
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'fixed';
+  textarea.style.left = '-9999px';
+  document.body.appendChild(textarea);
+  textarea.select();
+  let copied = false;
+  try {
+    copied = document.execCommand('copy');
+  } finally {
+    document.body.removeChild(textarea);
+  }
+  return copied;
 }
 
 function projectTypeLabel(type) {
@@ -306,6 +418,7 @@ function emptyDeliveryFilters() {
     project_id: '',
     work_item_id: '',
     case_id: '',
+    readiness: 'all',
     priority: 'all',
     automation_status: 'all',
     latest_status: 'all',
@@ -424,6 +537,32 @@ function flattenFeatureTree(nodes = [], depth = 0) {
   ]);
 }
 
+function buildFeatureTree(features = []) {
+  const nodesById = new Map();
+  features.forEach((feature) => {
+    if (!feature?.id) return;
+    nodesById.set(feature.id, {
+      ...feature,
+      parentId: feature.parentId || feature.parent_id || '',
+      children: [],
+    });
+  });
+  const roots = [];
+  nodesById.forEach((node) => {
+    const parent = nodesById.get(node.parentId);
+    if (parent && parent.id !== node.id) {
+      parent.children.push(node);
+      return;
+    }
+    roots.push(node);
+  });
+  return roots;
+}
+
+function isAuthRequiredError(error) {
+  return error?.message === '请先登录';
+}
+
 function collectFeatureIds(node) {
   return [
     node.id,
@@ -440,13 +579,25 @@ function App() {
   const [openModuleTabs, setOpenModuleTabs] = useState([HOME_MODULE_ID]);
   const [tabMenuOpen, setTabMenuOpen] = useState(false);
   const [themeId, setThemeId] = useState(readStoredTheme);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authUser, setAuthUser] = useState(null);
+  const [authMode, setAuthMode] = useState('login');
+  const [loginForm, setLoginForm] = useState({ username: '', password: '' });
+  const [registerForm, setRegisterForm] = useState({ username: '', display_name: '', password: '' });
+  const [authMessage, setAuthMessage] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [users, setUsers] = useState([]);
+  const [userActionMessage, setUserActionMessage] = useState('');
+  const [passwordForm, setPasswordForm] = useState({ current_password: '', new_password: '' });
+  const [passwordPanelOpen, setPasswordPanelOpen] = useState(false);
   const [health, setHealth] = useState({ status: 'checking', ai: { configured: false } });
   const [workItems, setWorkItems] = useState([]);
   const [currentItem, setCurrentItem] = useState(null);
   const currentItemRef = useRef(null);
   const selectedWorkItemIdRef = useRef('');
   const [projects, setProjects] = useState([]);
-  const [currentProjectId, setCurrentProjectId] = useState('default-local-project');
+  const [currentProjectId, setCurrentProjectId] = useState('');
   const [dashboardScopeProjectId, setDashboardScopeProjectId] = useState('all');
   const [dashboardSummary, setDashboardSummary] = useState(null);
   const [dashboardLoading, setDashboardLoading] = useState(false);
@@ -474,6 +625,15 @@ function App() {
   const monitorBrowserCanvasRef = useRef(null);
   const [selectedCaseIds, setSelectedCaseIds] = useState(() => new Set());
   const [newSuiteName, setNewSuiteName] = useState('回归测试套件');
+  const [scriptEditor, setScriptEditor] = useState({
+    open: false,
+    loading: false,
+    saving: false,
+    error: '',
+    detail: null,
+    content: '',
+    sourceCase: null,
+  });
   const [selectedSuiteId, setSelectedSuiteId] = useState('');
   const [suiteForm, setSuiteForm] = useState(() => normalizeSuiteForm());
   const [suiteEditing, setSuiteEditing] = useState(false);
@@ -498,19 +658,24 @@ function App() {
   const [exploring, setExploring] = useState(false);
   const [confirmedElementKeys, setConfirmedElementKeys] = useState(() => new Set());
   const confirmedElementKeysRef = useRef(confirmedElementKeys);
-  const [aiConfig, setAiConfig] = useState({ api_key: '', model: 'gpt-4.1-mini', base_url: 'https://api.openai.com/v1' });
+  const [aiConfig, setAiConfig] = useState(() => emptyAIConfig());
   const [testingAIConfig, setTestingAIConfig] = useState(false);
+  const [aiSecretVisible, setAiSecretVisible] = useState(false);
   const [analyzingRequirement, setAnalyzingRequirement] = useState(false);
   const [requirementForm, setRequirementForm] = useState(emptyRequirement());
+  const [requirementFeatureId, setRequirementFeatureId] = useState('');
+  const [requirementFeatureOptions, setRequirementFeatureOptions] = useState([]);
+  const [requirementFeatureTree, setRequirementFeatureTree] = useState([]);
   const [exploration, setExploration] = useState(emptyExploration);
   const [casesMarkdown, setCasesMarkdown] = useState('');
   const [scriptContent, setScriptContent] = useState('');
+  const [assetMode, setAssetMode] = useState('create');
   const [healingForm, setHealingForm] = useState({
     failure_summary: '等待执行失败后填写失败摘要。',
     proposed_fix: '记录选择器、等待策略或断言调整方案。',
   });
   const [automationRequirement, setAutomationRequirement] = useState('');
-  const [automationProjectId, setAutomationProjectId] = useState('default-local-project');
+  const [automationProjectId, setAutomationProjectId] = useState('');
   const [automationFeatureId, setAutomationFeatureId] = useState('');
   const [automationFeatureOptions, setAutomationFeatureOptions] = useState([]);
   const [automationFeatureTree, setAutomationFeatureTree] = useState([]);
@@ -539,6 +704,8 @@ function App() {
   const [expandedNavGroups, setExpandedNavGroups] = useState(() => new Set(NAV_GROUPS.map((group) => group.id)));
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const tabMenuRef = useRef(null);
+  const moduleTabsRef = useRef(null);
+  const activeModuleTabRef = useRef(null);
   const activeModuleRef = useRef(HOME_MODULE_ID);
   const scrollPositionsRef = useRef({ [HOME_MODULE_ID]: 0 });
   const pendingScrollRestoreRef = useRef(null);
@@ -575,6 +742,10 @@ function App() {
 
   function openModule(moduleId) {
     if (!MODULE_LOOKUP[moduleId]) return;
+    if (!moduleAllowed(moduleId)) {
+      setError('当前账号无权访问该模块');
+      return;
+    }
     if (activeModuleRef.current === moduleId) {
       setTabMenuOpen(false);
       return;
@@ -663,6 +834,15 @@ function App() {
   }, [activeModule]);
 
   useEffect(() => {
+    if (!moduleTabsRef.current || !activeModuleTabRef.current) return;
+    activeModuleTabRef.current.scrollIntoView({
+      block: 'nearest',
+      inline: 'end',
+      behavior: 'smooth',
+    });
+  }, [activeModule, openModuleTabs]);
+
+  useEffect(() => {
     function handleWindowScroll() {
       scrollPositionsRef.current[activeModuleRef.current] = currentWindowScrollY();
     }
@@ -716,6 +896,23 @@ function App() {
 
   const showWorkflowContext = WORKFLOW_CONTEXT_MODULES.has(activeModule);
   const activeNavGroupId = MODULE_GROUP_LOOKUP[activeModule];
+  const currentRole = authUser?.role || 'viewer';
+  const canManageUsers = currentRole === 'admin';
+  const canManageAI = currentRole === 'admin';
+  const canManageAssets = ['admin', 'lead'].includes(currentRole);
+  const canExecute = ['admin', 'lead', 'executor'].includes(currentRole);
+  const canCreateDrafts = ['admin', 'lead', 'executor'].includes(currentRole);
+  const canSaveArtifacts = ['admin', 'lead'].includes(currentRole);
+  const visibleNavGroups = useMemo(() => NAV_GROUPS
+    .map((group) => ({
+      ...group,
+      moduleIds: group.moduleIds.filter((moduleId) => (MODULE_ROLE_ACCESS[moduleId] || []).includes(currentRole)),
+    }))
+    .filter((group) => group.moduleIds.length), [currentRole]);
+
+  function moduleAllowed(moduleId) {
+    return (MODULE_ROLE_ACCESS[moduleId] || []).includes(currentRole);
+  }
   useEffect(() => {
     storeTheme(themeId);
   }, [themeId]);
@@ -740,13 +937,33 @@ function App() {
   }, [activeNavGroupId]);
 
   useEffect(() => {
+    if (!authUser) return;
+    const allowedTabs = openModuleTabs.filter((moduleId) => moduleAllowed(moduleId));
+    const nextTabs = allowedTabs.includes(HOME_MODULE_ID) ? allowedTabs : [HOME_MODULE_ID, ...allowedTabs];
+    if (nextTabs.length !== openModuleTabs.length) {
+      setOpenModuleTabs(nextTabs);
+      keepScrollPositionsForTabs(nextTabs);
+    }
+    if (!moduleAllowed(activeModule)) {
+      activeModuleRef.current = HOME_MODULE_ID;
+      setActiveModule(HOME_MODULE_ID);
+    }
+  }, [authUser?.role]);
+
+  useEffect(() => {
     const node = automationLogRef.current;
     if (!node) return;
     node.scrollTop = node.scrollHeight;
   }, [automationLogs]);
 
   useEffect(() => {
-    if (!projects.length) return;
+    if (!projects.length) {
+      if (automationProjectId) {
+        setAutomationProjectId('');
+        setAutomationFeatureId('');
+      }
+      return;
+    }
     if (!projects.find((project) => project.id === automationProjectId)) {
       setAutomationProjectId(projects[0].id);
       setAutomationFeatureId('');
@@ -754,6 +971,57 @@ function App() {
   }, [automationProjectId, projects]);
 
   useEffect(() => {
+    if (!projects.length) {
+      if (currentProjectId) {
+        setCurrentProjectId('');
+        setRequirementFeatureId('');
+      }
+      return;
+    }
+    if (!projects.find((project) => project.id === currentProjectId)) {
+      setCurrentProjectId(projects[0].id);
+      setRequirementFeatureId('');
+      return;
+    }
+  }, [currentProjectId, projects]);
+
+  useEffect(() => {
+    if (!authUser) return undefined;
+    if (!currentProjectId) {
+      setRequirementFeatureOptions([]);
+      setRequirementFeatureTree([]);
+      setRequirementFeatureId('');
+      return undefined;
+    }
+    let cancelled = false;
+    async function loadRequirementFeatures() {
+      try {
+        await ensureAuthenticated();
+        if (cancelled) return;
+        const payload = await fetchJson(`/api/features?project_id=${encodeURIComponent(currentProjectId)}`);
+        if (cancelled) return;
+        const activeItems = (payload.items || []).filter((feature) => feature.isActive);
+        setRequirementFeatureOptions(activeItems);
+        setRequirementFeatureTree(payload.tree || []);
+        setRequirementFeatureId((value) => activeItems.some((feature) => feature.id === value) ? value : '');
+      } catch (err) {
+        if (!cancelled) {
+          setRequirementFeatureOptions([]);
+          setRequirementFeatureTree([]);
+          setRequirementFeatureId('');
+          if (isAuthRequiredError(err)) return;
+          setError(`加载需求工单功能树失败：${err.message}`);
+        }
+      }
+    }
+    loadRequirementFeatures();
+    return () => {
+      cancelled = true;
+    };
+  }, [authUser?.id, currentProjectId]);
+
+  useEffect(() => {
+    if (!authUser) return undefined;
     if (!automationProjectId) {
       setAutomationFeatureOptions([]);
       setAutomationFeatureTree([]);
@@ -763,6 +1031,8 @@ function App() {
     let cancelled = false;
     async function loadAutomationFeatures() {
       try {
+        await ensureAuthenticated();
+        if (cancelled) return;
         const payload = await fetchJson(`/api/features?project_id=${encodeURIComponent(automationProjectId)}`);
         if (cancelled) return;
         const activeItems = (payload.items || []).filter((feature) => feature.isActive);
@@ -774,6 +1044,7 @@ function App() {
           setAutomationFeatureOptions([]);
           setAutomationFeatureTree([]);
           setAutomationFeatureId('');
+          if (isAuthRequiredError(err)) return;
           setError(`加载全流程功能树失败：${err.message}`);
         }
       }
@@ -782,7 +1053,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [automationProjectId]);
+  }, [authUser?.id, automationProjectId]);
 
   function applyAutomationSnapshot(payload) {
     setAutomationFlow(payload);
@@ -801,6 +1072,7 @@ function App() {
       setCurrentItem(workItem);
       setCasesMarkdown(workItem.casesMarkdown || '');
       setScriptContent(workItem.scriptContent || '');
+      setAssetMode(workItem.assetMode || 'create');
     }
     if (payload.latestRun) {
       setRuns((items) => {
@@ -875,11 +1147,13 @@ function App() {
   }, [automationFlowId]);
 
   useEffect(() => {
-    if (!automationFlowId) return undefined;
+    if (!authUser || !automationFlowId) return undefined;
     let cancelled = false;
 
     async function pollAutomationFlow() {
       try {
+        await ensureAuthenticated();
+        if (cancelled) return;
         const payload = await fetchJson(`/api/automation-flows/${automationFlowId}`);
         if (cancelled) return;
         applyAutomationSnapshot(payload);
@@ -894,7 +1168,7 @@ function App() {
           setError('');
         }
       } catch (err) {
-        if (!cancelled) setError(`获取全流程状态失败：${err.message}`);
+        if (!cancelled && !isAuthRequiredError(err)) setError(`获取全流程状态失败：${err.message}`);
       }
     }
 
@@ -905,7 +1179,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [automationFlowId, automationFlow?.status, automationLiveConnected]);
+  }, [authUser?.id, automationFlowId, automationFlow?.status, automationLiveConnected]);
 
   useEffect(() => {
     const { sessionId, mode } = automationBrowserTarget;
@@ -967,12 +1241,20 @@ function App() {
 
   useEffect(() => {
     if (!health.ai) return;
-    setAiConfig((value) => ({
-      ...value,
-      model: value.model || health.ai.model || 'gpt-4.1-mini',
-      base_url: health.ai.baseUrlLocked || value.base_url === 'https://api.openai.com/v1' ? health.ai.baseUrl || value.base_url : value.base_url,
-    }));
-  }, [health.ai?.baseUrl, health.ai?.baseUrlLocked, health.ai?.model]);
+    const activeProfile = health.ai.activeProfile;
+    if (!activeProfile) {
+      setAiConfig((value) => (value.id ? { ...emptyAIConfig(), api_key: value.api_key } : value));
+      return;
+    }
+    setAiConfig((value) => (value.id === activeProfile.id ? value : aiProfileToForm(activeProfile)));
+    setAiSecretVisible(false);
+  }, [health.ai?.activeProfileId]);
+
+  useEffect(() => {
+    if (!notice) return undefined;
+    const timer = window.setTimeout(() => setNotice(''), 4000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
 
   useEffect(() => {
     if (suiteEditing) return;
@@ -988,8 +1270,19 @@ function App() {
     setSuiteForm(normalizeSuiteForm());
   }, [suites, selectedSuiteId, suiteEditing]);
 
+  function handleAuthExpired(message = '登录状态已失效，请重新登录。') {
+    setAuthUser(null);
+    setAuthMode('login');
+    setAuthChecked(true);
+    setAuthError(message);
+  }
+
   async function fetchJson(path, options) {
-    const response = await fetch(`${API_BASE}${path}`, options);
+    const response = await fetch(`${API_BASE}${path}`, { credentials: 'include', ...(options || {}) });
+    if (response.status === 401) {
+      handleAuthExpired();
+      throw new Error('请先登录');
+    }
     if (!response.ok) {
       const text = await response.text();
       try {
@@ -1003,23 +1296,220 @@ function App() {
     return response.json();
   }
 
+  async function checkAuth() {
+    try {
+      const response = await fetch(`${API_BASE}/api/auth/me`, { credentials: 'include' });
+      const payload = await response.json();
+      setAuthUser(payload.authenticated ? payload.user : null);
+      setAuthChecked(true);
+      return { user: payload.authenticated ? payload.user : null, reachable: true };
+    } catch {
+      setAuthUser(null);
+      setAuthChecked(true);
+      return { user: null, reachable: false };
+    }
+  }
+
+  async function ensureAuthenticated() {
+    const { user, reachable } = await checkAuth();
+    if (!reachable) {
+      throw new Error('Failed to fetch');
+    }
+    if (!user) {
+      handleAuthExpired();
+      throw new Error('请先登录');
+    }
+    return user;
+  }
+
+  async function submitLogin() {
+    setAuthSubmitting(true);
+    setAuthError('');
+    setAuthMessage('');
+    try {
+      const response = await fetch(`${API_BASE}/api/auth/login`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(loginForm),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail || '登录失败');
+      setAuthUser(payload.user);
+      setAuthError('');
+      setPasswordForm({ current_password: '', new_password: '' });
+      await loadAll({ skipAuthCheck: true });
+    } catch (err) {
+      setAuthError(err.message);
+    } finally {
+      setAuthSubmitting(false);
+    }
+  }
+
+  async function submitRegister() {
+    setAuthSubmitting(true);
+    setAuthError('');
+    setAuthMessage('');
+    try {
+      const response = await fetch(`${API_BASE}/api/auth/register`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(registerForm),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.detail || '注册失败');
+      setRegisterForm({ username: '', display_name: '', password: '' });
+      setAuthMode('login');
+      setAuthMessage('注册已提交，请等待管理员审核启用。');
+    } catch (err) {
+      setAuthError(err.message);
+    } finally {
+      setAuthSubmitting(false);
+    }
+  }
+
+  async function logout() {
+    await fetch(`${API_BASE}/api/auth/logout`, { method: 'POST', credentials: 'include' }).catch(() => null);
+    setAuthUser(null);
+    setAuthMode('login');
+    setNotice('');
+    setError('');
+  }
+
+  async function changePassword() {
+    try {
+      await fetchJson('/api/auth/change-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(passwordForm),
+      });
+      setPasswordForm({ current_password: '', new_password: '' });
+      setPasswordPanelOpen(false);
+      setNotice('密码已修改');
+    } catch (err) {
+      setError(`修改密码失败：${err.message}`);
+    }
+  }
+
+  async function loadUsers() {
+    if (!canManageUsers) return [];
+    const payload = await fetchJson('/api/users');
+    setUsers(payload);
+    return payload;
+  }
+
+  async function updateUser(userId, patch) {
+    try {
+      const updated = await fetchJson(`/api/users/${userId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      setUsers((items) => items.map((item) => (item.id === userId ? updated : item)));
+      setUserActionMessage('用户信息已更新');
+      setError('');
+      return updated;
+    } catch (err) {
+      setError(`更新用户失败：${err.message}`);
+      return null;
+    }
+  }
+
+  async function createUser(payload) {
+    try {
+      const created = await fetchJson('/api/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      setUsers((items) => [created, ...items.filter((item) => item.id !== created.id)]);
+      setUserActionMessage('用户已创建');
+      setError('');
+      return created;
+    } catch (err) {
+      setError(`创建用户失败：${err.message}`);
+      return null;
+    }
+  }
+
+  async function deleteUser(userId) {
+    try {
+      await fetchJson(`/api/users/${userId}`, { method: 'DELETE' });
+      setUsers((items) => items.filter((item) => item.id !== userId));
+      setUserActionMessage('用户已删除');
+      setError('');
+    } catch (err) {
+      setError(`删除用户失败：${err.message}`);
+    }
+  }
+
+  async function resetUserPassword(userId) {
+    const password = window.prompt('请输入新密码（至少8位，包含字母和数字）');
+    if (!password) return;
+    try {
+      await fetchJson(`/api/users/${userId}/reset-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      });
+      setUserActionMessage('密码已重置');
+      setError('');
+    } catch (err) {
+      setError(`重置密码失败：${err.message}`);
+    }
+  }
+
   async function loadDeliveryReport(nextFilters = deliveryFilters, page = 1, pageSize = deliveryReport.pageSize || 50) {
     const payload = await fetchJson(buildDeliveryReportPath(nextFilters, page, pageSize));
     setDeliveryReport(payload);
     return payload;
   }
 
-  async function refreshCases(projectId = currentProjectId || 'default-local-project') {
+  async function refreshCases(projectId = currentProjectId) {
+    if (!projectId) {
+      setTestCases([]);
+      return [];
+    }
     const payload = await fetchJson(`/api/test-cases?project_id=${encodeURIComponent(projectId)}`);
     setTestCases(payload);
     return payload;
   }
 
-  async function refreshFeatures(projectId = currentProjectId || 'default-local-project') {
+  async function refreshFeatures(projectId = currentProjectId) {
+    if (!projectId) {
+      setFeatures([]);
+      setFeatureTree([]);
+      return { items: [], tree: [] };
+    }
     const payload = await fetchJson(`/api/features?project_id=${encodeURIComponent(projectId)}`);
     setFeatures(payload.items || []);
     setFeatureTree(payload.tree || []);
     return payload;
+  }
+
+  async function refreshCaseAssets(projectId = currentProjectId) {
+    if (!projectId) {
+      setTestCases([]);
+      setFeatures([]);
+      setFeatureTree([]);
+      setSuites([]);
+      await loadSuiteCaseProjects(projects);
+      return { cases: [], features: { items: [], tree: [] }, suites: [] };
+    }
+    const [casePayload, featurePayload, suitesPayload, dashboardPayload] = await Promise.all([
+      fetchJson(`/api/test-cases?project_id=${encodeURIComponent(projectId)}`),
+      fetchJson(`/api/features?project_id=${encodeURIComponent(projectId)}`),
+      fetchJson(`/api/test-suites?project_id=${encodeURIComponent(projectId)}`),
+      fetchJson(`/api/dashboard-summary?project_id=${encodeURIComponent(dashboardScopeProjectId || 'all')}`),
+    ]);
+    setTestCases(casePayload);
+    setFeatures(featurePayload.items || []);
+    setFeatureTree(featurePayload.tree || []);
+    setSuites(suitesPayload);
+    setDashboardSummary(dashboardPayload);
+    await loadSuiteCaseProjects(projects);
+    return { cases: casePayload, features: featurePayload, suites: suitesPayload };
   }
 
   async function loadSuiteCaseProjects(projectItems = projects) {
@@ -1061,25 +1551,33 @@ function App() {
     }
   }
 
-  async function loadAll() {
+  async function loadAll(options = {}) {
     try {
-      const projectId = currentProjectId || 'default-local-project';
-      const [healthPayload, projectPayload, workPayload, casePayload, featurePayload, deliverablePayload, suitesPayload, suiteRunPayload, runsPayload, dashboardPayload] = await Promise.all([
+      if (!options.skipAuthCheck) {
+        await ensureAuthenticated();
+      }
+      const projectId = currentProjectId;
+      const [healthPayload, projectPayload, workPayload, deliverablePayload, runsPayload, dashboardPayload] = await Promise.all([
         fetchJson('/api/health'),
         fetchJson('/api/projects'),
         fetchJson('/api/work-items'),
-        fetchJson(`/api/test-cases?project_id=${encodeURIComponent(projectId)}`),
-        fetchJson(`/api/features?project_id=${encodeURIComponent(projectId)}`),
         fetchJson('/api/deliverables?include_content=false'),
-        fetchJson(`/api/test-suites?project_id=${encodeURIComponent(projectId)}`),
-        fetchJson(`/api/suite-runs?project_id=${encodeURIComponent(projectId)}`),
         fetchJson('/api/runs'),
         fetchJson(`/api/dashboard-summary?project_id=${encodeURIComponent(dashboardScopeProjectId || 'all')}`),
       ]);
+      const nextProjectId = projectPayload.find((project) => project.id === projectId)?.id || projectPayload[0]?.id || '';
+      const [casePayload, featurePayload, suitesPayload, suiteRunPayload] = nextProjectId
+        ? await Promise.all([
+          fetchJson(`/api/test-cases?project_id=${encodeURIComponent(nextProjectId)}`),
+          fetchJson(`/api/features?project_id=${encodeURIComponent(nextProjectId)}`),
+          fetchJson(`/api/test-suites?project_id=${encodeURIComponent(nextProjectId)}`),
+          fetchJson(`/api/suite-runs?project_id=${encodeURIComponent(nextProjectId)}`),
+        ])
+        : [[], { items: [], tree: [] }, [], []];
       setHealth(healthPayload);
       setProjects(projectPayload);
-      if (!projectPayload.find((project) => project.id === currentProjectId) && projectPayload[0]) {
-        setCurrentProjectId(projectPayload[0].id);
+      if (nextProjectId !== currentProjectId) {
+        setCurrentProjectId(nextProjectId);
       }
       await loadSuiteCaseProjects(projectPayload);
       setWorkItems(workPayload);
@@ -1099,6 +1597,10 @@ function App() {
       }
       setError('');
     } catch (err) {
+      if (isAuthRequiredError(err)) {
+        handleAuthExpired();
+        return;
+      }
       setHealth((value) => ({ ...value, status: 'offline' }));
       setError(`后端连接失败：${err.message}`);
     }
@@ -1110,6 +1612,7 @@ function App() {
     setCurrentItem(item);
     setCasesMarkdown(item.casesMarkdown || '');
     setScriptContent(item.scriptContent || '');
+    setAssetMode(item.assetMode || 'create');
     if (item.explorations?.[0]) {
       const nextElements = item.elements?.length ? item.elements : emptyExploration().elements;
       setConfirmedElementKeys(new Set(nextElements.filter((element) => element.confirmed).map(elementKey).filter(Boolean)));
@@ -1127,39 +1630,55 @@ function App() {
   }
 
   useEffect(() => {
+    checkAuth();
+  }, []);
+
+  useEffect(() => {
+    if (!authUser) return undefined;
     loadAll();
     const timer = window.setInterval(loadAll, 5000);
     return () => window.clearInterval(timer);
-  }, [currentProjectId, dashboardScopeProjectId]);
+  }, [authUser?.id, currentProjectId, dashboardScopeProjectId]);
 
   useEffect(() => {
-    if (activeModule !== 'delivery') return undefined;
+    if (activeModule !== 'user-management' || !canManageUsers) return undefined;
+    loadUsers().catch((err) => setError(`加载用户列表失败：${err.message}`));
+    return undefined;
+  }, [activeModule, canManageUsers]);
+
+  useEffect(() => {
+    if (!authUser || activeModule !== 'delivery') return undefined;
     let cancelled = false;
     async function refreshDelivery() {
       try {
+        await ensureAuthenticated();
+        if (cancelled) return;
         const payload = await fetchJson(buildDeliveryReportPath(deliveryFilters, deliveryReport.page || 1, deliveryReport.pageSize || 50));
         if (!cancelled) setDeliveryReport(payload);
       } catch (err) {
-        if (!cancelled) setError(`加载交付报告失败：${err.message}`);
+        if (!cancelled && !isAuthRequiredError(err)) setError(`加载交付报告失败：${err.message}`);
       }
     }
     refreshDelivery();
     return () => {
       cancelled = true;
     };
-  }, [activeModule]);
+  }, [authUser?.id, activeModule]);
 
   useEffect(() => {
-    if (!latestSuiteRun?.id) return undefined;
+    if (!authUser || !latestSuiteRun?.id) return undefined;
     let cancelled = false;
     async function pollSuiteRun() {
       try {
+        await ensureAuthenticated();
+        if (cancelled) return;
         const payload = await fetchJson(`/api/suite-runs/${latestSuiteRun.id}`);
         if (!cancelled) {
           setLatestSuiteRun(payload);
           setSuiteRuns((items) => items.map((item) => (item.id === payload.id ? payload : item)));
           if (payload.status !== 'running' && payload.status !== 'queued') {
-            const projectId = currentProjectId || 'default-local-project';
+            const projectId = currentProjectId;
+            if (!projectId) return;
             const [casePayload, deliverablePayload] = await Promise.all([
               fetchJson(`/api/test-cases?project_id=${encodeURIComponent(projectId)}`),
               fetchJson(`/api/deliverables?project_id=${encodeURIComponent(projectId)}`),
@@ -1178,7 +1697,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [latestSuiteRun?.id, latestSuiteRun?.status, currentProjectId]);
+  }, [authUser?.id, latestSuiteRun?.id, latestSuiteRun?.status, currentProjectId]);
 
   useEffect(() => {
     if (latestSuiteRun?.id && !monitorSuiteRunId) {
@@ -1187,11 +1706,18 @@ function App() {
   }, [latestSuiteRun?.id, monitorSuiteRunId]);
 
   useEffect(() => {
-    if (activeModule !== 'execution-monitor') return undefined;
+    if (!authUser || activeModule !== 'execution-monitor') return undefined;
     let cancelled = false;
     async function pollMonitorList() {
       try {
-        const projectId = currentProjectId || 'default-local-project';
+        await ensureAuthenticated();
+        if (cancelled) return;
+        const projectId = currentProjectId;
+        if (!projectId) {
+          setSuiteRuns([]);
+          setLatestSuiteRun((current) => current);
+          return;
+        }
         const payload = await fetchJson(`/api/suite-runs?project_id=${encodeURIComponent(projectId)}`);
         if (cancelled) return;
         setSuiteRuns(payload);
@@ -1203,7 +1729,7 @@ function App() {
           setMonitorSuiteRunId(payload[0].id);
         }
       } catch (err) {
-        if (!cancelled) setError(`刷新执行监控列表失败：${err.message}`);
+        if (!cancelled && !isAuthRequiredError(err)) setError(`刷新执行监控列表失败：${err.message}`);
       }
     }
     pollMonitorList();
@@ -1212,13 +1738,15 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [activeModule, currentProjectId, monitorSuiteRunId]);
+  }, [authUser?.id, activeModule, currentProjectId, monitorSuiteRunId]);
 
   useEffect(() => {
-    if (activeModule !== 'execution-monitor' || !monitorSuiteRunId) return undefined;
+    if (!authUser || activeModule !== 'execution-monitor' || !monitorSuiteRunId) return undefined;
     let cancelled = false;
     async function pollMonitorDetail() {
       try {
+        await ensureAuthenticated();
+        if (cancelled) return;
         const [detailPayload, logPayload] = await Promise.all([
           fetchJson(`/api/suite-runs/${monitorSuiteRunId}`),
           fetchJson(`/api/suite-runs/${monitorSuiteRunId}/logs`),
@@ -1232,7 +1760,7 @@ function App() {
         });
         setLatestSuiteRun((current) => (current?.id === detailPayload.id ? detailPayload : current));
       } catch (err) {
-        if (!cancelled) setError(`刷新执行监控详情失败：${err.message}`);
+        if (!cancelled && !isAuthRequiredError(err)) setError(`刷新执行监控详情失败：${err.message}`);
       }
     }
     pollMonitorDetail();
@@ -1242,7 +1770,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [activeModule, monitorSuiteRunId, monitorSuiteRunDetail?.status]);
+  }, [authUser?.id, activeModule, monitorSuiteRunId, monitorSuiteRunDetail?.status]);
 
   useEffect(() => {
     setMonitorSelectedCaseRunId('');
@@ -1263,16 +1791,19 @@ function App() {
   }, [monitorBrowserTarget.runId]);
 
   useEffect(() => {
-    if (activeModule !== 'execution-monitor' || !monitorBrowserTarget.runId) return undefined;
+    if (!authUser || activeModule !== 'execution-monitor' || !monitorBrowserTarget.runId) return undefined;
     let cancelled = false;
     async function pollMonitorBrowserRun() {
       try {
+        await ensureAuthenticated();
+        if (cancelled) return;
         const runPayload = await fetchJson(`/api/runs/${monitorBrowserTarget.runId}`);
         if (cancelled) return;
         setMonitorBrowserRun(runPayload);
         setMonitorBrowserStatus(runPayload.browserSession?.status || runPayload.status || 'Connecting');
       } catch (err) {
         if (!cancelled) {
+          if (isAuthRequiredError(err)) return;
           setMonitorBrowserDetail(`刷新执行浏览器画面失败：${err.message}`);
           setMonitorBrowserStatus('Closed');
         }
@@ -1285,7 +1816,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [activeModule, monitorBrowserTarget.runId, monitorBrowserTarget.caseItem?.status, monitorBrowserRun?.status]);
+  }, [authUser?.id, activeModule, monitorBrowserTarget.runId, monitorBrowserTarget.caseItem?.status, monitorBrowserRun?.status]);
 
   useEffect(() => {
     const sessionId = monitorBrowserRun?.browserSessionId;
@@ -1330,10 +1861,12 @@ function App() {
   }, [activeModule, monitorBrowserRun?.browserSessionId]);
 
   useEffect(() => {
-    if (!latestRun?.id) return undefined;
+    if (!authUser || !latestRun?.id) return undefined;
     let cancelled = false;
     async function pollRun() {
       try {
+        await ensureAuthenticated();
+        if (cancelled) return;
         const [runPayload, logPayload, imagePayload] = await Promise.all([
           fetchJson(`/api/runs/${latestRun.id}`),
           fetchJson(`/api/runs/${latestRun.id}/logs`),
@@ -1358,7 +1891,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [latestRun?.id, latestRun?.status]);
+  }, [authUser?.id, latestRun?.id, latestRun?.status]);
 
   useEffect(() => {
     const sessionId = latestRun?.browserSessionId;
@@ -1386,11 +1919,13 @@ function App() {
   }, [latestRun?.browserSessionId]);
 
   useEffect(() => {
-    if (!explorationRun?.id) return undefined;
+    if (!authUser || !explorationRun?.id) return undefined;
     let cancelled = false;
 
     async function pollExplorationRun() {
       try {
+        await ensureAuthenticated();
+        if (cancelled) return;
         const payload = await fetchJson(`/api/exploration-runs/${explorationRun.id}`);
         if (cancelled) return;
         setExplorationRun(payload);
@@ -1412,6 +1947,7 @@ function App() {
         }
       } catch (err) {
         if (!cancelled) {
+          if (isAuthRequiredError(err)) return;
           setExploring(false);
           setError(`获取探索流程失败：${err.message}`);
         }
@@ -1424,7 +1960,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [explorationRun?.id, explorationRun?.status]);
+  }, [authUser?.id, explorationRun?.id, explorationRun?.status]);
 
   useEffect(() => {
     const sessionId = explorationRun?.browserSessionId;
@@ -1452,12 +1988,20 @@ function App() {
   }, [explorationRun?.browserSessionId]);
 
   async function createWorkItem() {
+    if (!currentProjectId) {
+      setError('项目名称为必填项，请先选择项目管理中的项目。');
+      return;
+    }
+    if (!requirementFeatureId) {
+      setError('功能为必填项，请先选择所选项目对应功能树上的功能。');
+      return;
+    }
     setAnalyzingRequirement(true);
     try {
       const item = await fetchJson('/api/work-items', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...requirementForm, project_id: currentProjectId }),
+        body: JSON.stringify({ ...requirementForm, project_id: currentProjectId, feature_id: requirementFeatureId }),
       });
       setError('');
       setWorkItems((items) => [item, ...items]);
@@ -1466,6 +2010,7 @@ function App() {
       currentItemRef.current = item;
       setCasesMarkdown(item.casesMarkdown || '');
       setScriptContent(item.scriptContent || '');
+      setAssetMode(item.assetMode || 'create');
       setConfirmedElementKeys(new Set());
       setExploration(emptyExploration());
       openModule('requirements');
@@ -1513,8 +2058,124 @@ function App() {
     }
   }
 
+  async function openScriptEditor(caseItem) {
+    if (!caseItem?.scriptVersionId) return;
+    setScriptEditor({
+      open: true,
+      loading: true,
+      saving: false,
+      error: '',
+      detail: null,
+      content: '',
+      sourceCase: caseItem,
+    });
+    try {
+      const detail = await fetchJson(`/api/script-versions/${caseItem.scriptVersionId}`);
+      setScriptEditor({
+        open: true,
+        loading: false,
+        saving: false,
+        error: '',
+        detail,
+        content: detail.content || '',
+        sourceCase: caseItem,
+      });
+      setError('');
+    } catch (err) {
+      setScriptEditor((value) => ({ ...value, loading: false, error: err.message }));
+    }
+  }
+
+  function closeScriptEditor() {
+    setScriptEditor((value) => ({ ...value, open: false, loading: false, saving: false, error: '' }));
+  }
+
+  function updateScriptEditorContent(content) {
+    setScriptEditor((value) => ({ ...value, content }));
+  }
+
+  async function saveScriptEditorDraft() {
+    if (!scriptEditor.detail?.id) return;
+    setScriptEditor((value) => ({ ...value, saving: true, error: '' }));
+    try {
+      const draft = await fetchJson(`/api/script-versions/${scriptEditor.detail.id}/draft`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: scriptEditor.content }),
+      });
+      setScriptEditor((value) => ({
+        ...value,
+        saving: false,
+        detail: draft,
+        content: draft.content || value.content,
+        error: '',
+      }));
+      if (draft.workItemId && (draft.workItemId === currentItemRef.current?.id || draft.workItemId === selectedWorkItemIdRef.current)) {
+        const item = await fetchJson(`/api/work-items/${draft.workItemId}`);
+        setCurrentItem(item);
+        currentItemRef.current = item;
+        setScriptContent(item.scriptContent || draft.content || scriptEditor.content);
+        setAssetMode(item.assetMode || 'create');
+      }
+      await refreshCaseAssets();
+      setNotice(`已另存为草稿脚本 v${draft.version || '-'}，active 绑定将在验证发布后替换。`);
+      setError('');
+    } catch (err) {
+      setScriptEditor((value) => ({ ...value, saving: false, error: err.message }));
+    }
+  }
+
+  async function deleteCase(caseItem) {
+    if (!caseItem?.id) return;
+    const label = [caseItem.externalId, caseItem.title].filter(Boolean).join(' · ') || caseItem.id;
+    if (!window.confirm(`确认删除用例「${label}」？此操作会从测试套件中移除关联，但保留执行历史和交付物文件。`)) return;
+    try {
+      await fetchJson(`/api/test-cases/${caseItem.id}`, { method: 'DELETE' });
+      setSelectedCaseIds((previous) => {
+        const next = new Set(previous);
+        next.delete(caseItem.id);
+        return next;
+      });
+      await refreshCaseAssets();
+      setNotice(`用例已删除：${label}`);
+      setError('');
+    } catch (err) {
+      setError(`删除用例失败：${err.message}`);
+    }
+  }
+
+  async function deleteSelectedCases() {
+    const caseIds = Array.from(selectedCaseIds);
+    if (!caseIds.length) {
+      setError('请先选择至少一个用例再删除');
+      return;
+    }
+    if (!window.confirm(`确认删除已选 ${caseIds.length} 条用例？此操作会从测试套件中移除关联，但保留执行历史和交付物文件。`)) return;
+    try {
+      const payload = await fetchJson('/api/test-cases/bulk-delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ case_ids: caseIds }),
+      });
+      setSelectedCaseIds((previous) => {
+        const next = new Set(previous);
+        caseIds.forEach((caseId) => next.delete(caseId));
+        return next;
+      });
+      await refreshCaseAssets();
+      setNotice(`已删除 ${payload.deleted || caseIds.length} 条用例`);
+      setError('');
+    } catch (err) {
+      setError(`批量删除用例失败：${err.message}`);
+    }
+  }
+
   async function createSuiteFromSelection() {
     const caseIds = Array.from(selectedCaseIds);
+    if (!currentProjectId) {
+      setError('请先在项目管理中创建项目。');
+      return;
+    }
     if (!caseIds.length) {
       setError('请先选择至少一个用例再创建套件');
       return;
@@ -1574,6 +2235,10 @@ function App() {
       return;
     }
     const suiteProjectId = selectedProjectIds.values().next().value || suiteForm.projectId || currentProjectId;
+    if (!suiteProjectId) {
+      setError('请先选择项目后再保存套件');
+      return;
+    }
     if ((suiteForm.caseIds || []).length !== selectedCases.length) {
       setError('存在无法识别的用例，请刷新页面后重新选择');
       return;
@@ -1689,11 +2354,45 @@ function App() {
         body: JSON.stringify(aiConfig),
       });
       setHealth((value) => ({ ...value, ai: payload }));
-      setAiConfig((value) => ({ ...value, api_key: '', model: payload.model || value.model, base_url: payload.baseUrl || value.base_url }));
+      setAiConfig({ ...aiProfileToForm(payload.activeProfile), api_key: '' });
+      setAiSecretVisible(false);
       setError('');
-      setNotice('AI 配置已保存');
+      setNotice('AI 配置档案已保存');
     } catch (err) {
       setError(`保存 AI 配置失败：${err.message}`);
+    }
+  }
+
+  function newAIConfig() {
+    setAiConfig(emptyAIConfig());
+    setAiSecretVisible(false);
+    setError('');
+  }
+
+  function selectAIProfile(profile) {
+    setAiConfig(aiProfileToForm(profile));
+    setAiSecretVisible(false);
+    setError('');
+  }
+
+  async function activateAIProfile(profileId = aiConfig.id) {
+    if (!profileId) {
+      setError('请先选择已保存的 AI 配置档案');
+      return;
+    }
+    try {
+      const payload = await fetchJson('/api/ai-config/active', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profile_id: profileId }),
+      });
+      setHealth((value) => ({ ...value, ai: payload }));
+      setAiConfig({ ...aiProfileToForm(payload.activeProfile), api_key: '' });
+      setAiSecretVisible(false);
+      setError('');
+      setNotice('已切换当前 AI 配置');
+    } catch (err) {
+      setError(`切换 AI 配置失败：${err.message}`);
     }
   }
 
@@ -1710,6 +2409,7 @@ function App() {
         ai: {
           ...(value.ai || {}),
           configured: true,
+          provider: payload.provider || value.ai?.provider,
           model: payload.model,
           baseUrl: payload.baseUrl,
           connectionStatus: 'connected',
@@ -1729,11 +2429,86 @@ function App() {
     try {
       const payload = await fetchJson('/api/ai-config', { method: 'DELETE' });
       setHealth((value) => ({ ...value, ai: payload }));
-      setAiConfig((value) => ({ ...value, api_key: '', base_url: payload.baseUrl || 'https://api.openai.com/v1' }));
+      setAiConfig({ ...aiProfileToForm(payload.activeProfile), api_key: '' });
+      setAiSecretVisible(false);
       setError('');
       setNotice('本地 AI 配置已清除');
     } catch (err) {
       setError(`清除 AI 配置失败：${err.message}`);
+    }
+  }
+
+  async function deleteAIProfile(profileId = aiConfig.id) {
+    if (!profileId) {
+      setError('请先选择已保存的 AI 配置档案');
+      return;
+    }
+    try {
+      const payload = await fetchJson(`/api/ai-config?profile_id=${encodeURIComponent(profileId)}`, { method: 'DELETE' });
+      setHealth((value) => ({ ...value, ai: payload }));
+      setAiConfig({ ...aiProfileToForm(payload.activeProfile), api_key: '' });
+      setAiSecretVisible(false);
+      setError('');
+      setNotice('AI 配置档案已删除');
+    } catch (err) {
+      setError(`删除 AI 配置失败：${err.message}`);
+    }
+  }
+
+  async function revealAISecret() {
+    if (health.ai?.envLocked) {
+      setError('API Key 已由环境变量配置，页面无法读取服务进程的环境变量明文。');
+      return '';
+    }
+    if (aiConfig.api_key) {
+      setAiSecretVisible((value) => !value);
+      setError('');
+      return aiConfig.api_key;
+    }
+    if (!aiConfig.id) {
+      setAiSecretVisible((value) => !value);
+      setError('');
+      return '';
+    }
+    try {
+      const payload = await fetchJson(`/api/ai-config/${encodeURIComponent(aiConfig.id)}/secret`);
+      setAiConfig((value) => ({ ...value, api_key: payload.apiKey || '' }));
+      setAiSecretVisible(true);
+      setError('');
+      return payload.apiKey || '';
+    } catch (err) {
+      setError(`读取 AI 密钥失败：${err.message}`);
+      return '';
+    }
+  }
+
+  async function copyAISecret() {
+    if (health.ai?.envLocked) {
+      setError('API Key 已由环境变量配置，页面无法复制环境变量明文。');
+      return;
+    }
+    let secret = aiConfig.api_key;
+    if (!secret && aiConfig.id) {
+      try {
+        const payload = await fetchJson(`/api/ai-config/${encodeURIComponent(aiConfig.id)}/secret`);
+        secret = payload.apiKey || '';
+        setAiConfig((value) => ({ ...value, api_key: secret }));
+      } catch (err) {
+        setError(`复制 AI 密钥失败：${err.message}`);
+        return;
+      }
+    }
+    if (!secret) {
+      setError('当前没有可复制的 API Key');
+      return;
+    }
+    try {
+      const copied = await writeClipboardText(secret);
+      if (!copied) throw new Error('浏览器拒绝写入剪贴板');
+      setError('');
+      setNotice('API Key 已复制');
+    } catch (err) {
+      setError(`复制 AI 密钥失败：${err.message}`);
     }
   }
 
@@ -2023,10 +2798,15 @@ function App() {
       const item = await fetchJson(`/api/work-items/${currentItem.id}/generate-cases`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: casesMarkdown }),
+        body: JSON.stringify({
+          content: casesMarkdown,
+          asset_mode: assetMode,
+          case_ids: currentItem.caseIds || [],
+        }),
       });
       setError('');
       setCurrentItem(item);
+      setAssetMode(item.assetMode || assetMode);
       openModule('exploration');
       setCasesMarkdown(item.casesMarkdown || casesMarkdown);
       await loadAll();
@@ -2041,10 +2821,15 @@ function App() {
       const item = await fetchJson(`/api/work-items/${currentItem.id}/generate-script`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: scriptContent }),
+        body: JSON.stringify({
+          content: scriptContent,
+          asset_mode: assetMode,
+          case_ids: currentItem.caseIds || [],
+        }),
       });
       setError('');
       setCurrentItem(item);
+      setAssetMode(item.assetMode || assetMode);
       openModule('execution');
       setScriptContent(item.scriptContent || scriptContent);
     } catch (err) {
@@ -2064,6 +2849,8 @@ function App() {
           cases_markdown: casesMarkdown || refreshedItem.casesMarkdown || '',
           script_content: scriptContent || refreshedItem.scriptContent || '',
           report_content: '',
+          asset_mode: assetMode,
+          case_ids: refreshedItem.caseIds || currentItem.caseIds || [],
         }),
       });
       setError('');
@@ -2159,6 +2946,51 @@ function App() {
     });
   }
 
+  if (!authChecked) {
+    return (
+      <main className="auth-shell" data-theme={themeId}>
+        <section className="auth-panel auth-layout auth-loading-layout" aria-label="检查登录状态">
+          <AuthWorkspaceHero />
+          <div className="auth-card auth-loading-card">
+            <div className="auth-card-header">
+              <span className="auth-kicker">SESSION CHECK</span>
+              <h1>自动化测试平台</h1>
+              <p>正在检查登录状态...</p>
+            </div>
+            <div className="auth-loading-indicator" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </div>
+          </div>
+        </section>
+      </main>
+    );
+  }
+
+  if (!authUser) {
+    return (
+      <AuthGate
+        mode={authMode}
+        setMode={setAuthMode}
+        clearAuthFeedback={() => {
+          setAuthError('');
+          setAuthMessage('');
+        }}
+        loginForm={loginForm}
+        setLoginForm={setLoginForm}
+        registerForm={registerForm}
+        setRegisterForm={setRegisterForm}
+        submitLogin={submitLogin}
+        submitRegister={submitRegister}
+        submitting={authSubmitting}
+        error={authError}
+        message={authMessage}
+        themeId={themeId}
+      />
+    );
+  }
+
   return (
     <main className={sidebarCollapsed ? 'platform-shell sidebar-collapsed' : 'platform-shell'} data-theme={themeId}>
       <aside className={sidebarCollapsed ? 'app-sidebar collapsed' : 'app-sidebar'}>
@@ -2178,9 +3010,29 @@ function App() {
             </div>
           )}
         </div>
-        {!sidebarCollapsed && (
-          <nav aria-label="平台模块">
-            {NAV_GROUPS.map((group) => {
+        <nav className={sidebarCollapsed ? 'collapsed-nav' : undefined} aria-label="平台模块">
+          {sidebarCollapsed ? (
+            visibleNavGroups.flatMap((group) => group.moduleIds).map((moduleId) => {
+              const module = MODULE_LOOKUP[moduleId];
+              const Icon = module.icon;
+              const label = module.navLabel || module.label;
+              const active = activeModule === module.id;
+              return (
+                <button
+                  type="button"
+                  key={module.id}
+                  className={active ? 'nav-icon-item active' : 'nav-icon-item'}
+                  aria-label={label}
+                  aria-current={active ? 'page' : undefined}
+                  title={label}
+                  onClick={() => openModule(module.id)}
+                >
+                  <Icon size={19} />
+                </button>
+              );
+            })
+          ) : (
+            visibleNavGroups.map((group) => {
               const GroupIcon = group.icon;
               const expanded = expandedNavGroups.has(group.id);
               const activeGroup = group.id === activeNavGroupId;
@@ -2209,7 +3061,7 @@ function App() {
                             onClick={() => openModule(module.id)}
                           >
                             <Icon size={18} />
-                            <span className="nav-label">{module.label}</span>
+                            <span className="nav-label">{module.navLabel || module.label}</span>
                           </button>
                         );
                       })}
@@ -2217,9 +3069,9 @@ function App() {
                   )}
                 </section>
               );
-            })}
-          </nav>
-        )}
+            })
+          )}
+        </nav>
       </aside>
 
       <section className="app-main">
@@ -2239,7 +3091,13 @@ function App() {
                 themes={THEMES}
                 themeId={themeId}
                 setThemeId={setThemeId}
-                onLocalLogout={() => setNotice('本地模式无需退出')}
+                user={authUser}
+                passwordPanelOpen={passwordPanelOpen}
+                setPasswordPanelOpen={setPasswordPanelOpen}
+                passwordForm={passwordForm}
+                setPasswordForm={setPasswordForm}
+                changePassword={changePassword}
+                logout={logout}
               />
             </div>
           </div>
@@ -2256,6 +3114,8 @@ function App() {
             menuOpen={tabMenuOpen}
             setMenuOpen={setTabMenuOpen}
             menuRef={tabMenuRef}
+            tabsRef={moduleTabsRef}
+            activeTabRef={activeModuleTabRef}
           />
         </header>
 
@@ -2263,12 +3123,18 @@ function App() {
           <section className="error-banner" role="alert" data-testid="error-banner">
             <XCircle size={18} />
             <span>{error}</span>
+            <button type="button" className="banner-close-button" aria-label="关闭错误提示" onClick={() => setError('')}>
+              <X size={15} />
+            </button>
           </section>
         )}
         {notice && (
           <section className="notice-banner" role="status" data-testid="notice-banner">
             <CheckCircle2 size={18} />
             <span>{notice}</span>
+            <button type="button" className="banner-close-button" aria-label="关闭提示" onClick={() => setNotice('')}>
+              <X size={15} />
+            </button>
           </section>
         )}
 
@@ -2289,7 +3155,8 @@ function App() {
                 selectWorkItem={selectWorkItem}
               />
             )}
-            {activeModule === 'ai-config' && <AIConfig health={health} aiConfig={aiConfig} setAiConfig={setAiConfig} saveAIConfig={saveAIConfig} clearAIConfig={clearAIConfig} testAIConfig={testAIConfig} testingAIConfig={testingAIConfig} />}
+            {activeModule === 'ai-config' && <AIConfig health={health} aiConfig={aiConfig} setAiConfig={setAiConfig} saveAIConfig={saveAIConfig} clearAIConfig={clearAIConfig} testAIConfig={testAIConfig} testingAIConfig={testingAIConfig} newAIConfig={newAIConfig} selectAIProfile={selectAIProfile} activateAIProfile={activateAIProfile} deleteAIProfile={deleteAIProfile} aiSecretVisible={aiSecretVisible} revealAISecret={revealAISecret} copyAISecret={copyAISecret} />}
+            {activeModule === 'user-management' && <UserManagement users={users} loadUsers={loadUsers} createUser={createUser} updateUser={updateUser} deleteUser={deleteUser} resetUserPassword={resetUserPassword} message={userActionMessage} />}
             {activeModule === 'feature-menus' && <FeatureMenus projects={projects} currentProjectId={currentProjectId} setCurrentProjectId={setCurrentProjectId} features={features} featureTree={featureTree} refreshFeatures={refreshFeatures} fetchJson={fetchJson} setNotice={setNotice} setError={setError} />}
             {activeModule === 'projects' && <Projects projects={projects} setProjects={setProjects} currentProjectId={currentProjectId} setCurrentProjectId={setCurrentProjectId} workItems={workItems} testCases={testCases} deliverables={deliverables} suiteRuns={suiteRuns} fetchJson={fetchJson} setNotice={setNotice} setError={setError} />}
             {activeModule === 'test-suites' && (
@@ -2370,16 +3237,34 @@ function App() {
                 clearFlow={clearAutomationFlow}
                 logRef={automationLogRef}
                 resetKey={automationResetKey}
+                canRunFlow={canExecute}
               />
             )}
-            {activeModule === 'requirements' && <Requirements form={requirementForm} setForm={setRequirementForm} createWorkItem={createWorkItem} item={currentItem} analyzing={analyzingRequirement} setActiveModule={openModule} />}
-            {activeModule === 'case-management' && <CaseManagement testCases={testCases} features={features} selectedCaseIds={selectedCaseIds} toggleCaseSelection={toggleCaseSelection} setAllVisibleCasesSelected={setAllVisibleCasesSelected} runSelectedCases={runSelectedCases} createSuiteFromSelection={createSuiteFromSelection} newSuiteName={newSuiteName} setNewSuiteName={setNewSuiteName} setActiveModule={openModule} bindCaseFeature={bindCaseFeature} />}
-            {activeModule === 'exploration' && <Exploration item={currentItem} exploration={exploration} explorationRun={explorationRun} explorationLogs={explorationLogs} browserStatus={browserStatus} browserStatusDetail={browserStatusDetail} liveConnected={liveConnected} browserCanvasRef={browserCanvasRef} setExploration={setExploration} updateElement={updateElement} addElement={addElement} setAllElementsConfirmed={setAllElementsConfirmed} saveExploration={saveExploration} runExploration={runExploration} exploring={exploring} sendBrowserCommand={sendBrowserCommand} handleBrowserClick={handleBrowserClick} handleBrowserMove={handleBrowserMove} handleBrowserWheel={handleBrowserWheel} handleBrowserKeyDown={handleBrowserKeyDown} />}
-            {activeModule === 'cases' && <Cases item={currentItem} casesMarkdown={casesMarkdown} setCasesMarkdown={setCasesMarkdown} generateCases={generateCases} />}
-            {activeModule === 'scripts' && <Scripts item={currentItem} latestRun={latestRun} scriptContent={scriptContent} setScriptContent={setScriptContent} generateScript={generateScript} saveArtifacts={saveArtifacts} />}
-            {activeModule === 'execution' && <Execution latestRun={latestRun} logs={logs} screenshot={screenshot} runCurrentItem={runCurrentItem} currentItem={currentItem} browserStatus={executionBrowserStatus} browserStatusDetail={executionBrowserDetail} liveConnected={executionLiveConnected} browserCanvasRef={executionBrowserCanvasRef} sendBrowserCommand={sendExecutionBrowserCommand} handleBrowserClick={handleExecutionBrowserClick} handleBrowserMove={handleExecutionBrowserMove} handleBrowserWheel={handleExecutionBrowserWheel} handleBrowserKeyDown={handleExecutionBrowserKeyDown} />}
-            {activeModule === 'healing' && <Healing item={currentItem} form={healingForm} setForm={setHealingForm} recordHealing={recordHealing} />}
-            {activeModule === 'delivery' && <Delivery item={currentItem} projects={projects} deliveryReport={deliveryReport} deliveryFilters={deliveryFilters} setDeliveryFilters={setDeliveryFilters} loadDeliveryReport={loadDeliveryReport} fetchJson={fetchJson} />}
+            {activeModule === 'requirements' && (
+              <Requirements
+                projects={projects}
+                selectedProjectId={currentProjectId}
+                selectedFeatureId={requirementFeatureId}
+                featureTree={requirementFeatureTree}
+                featureOptions={requirementFeatureOptions}
+                onProjectChange={setCurrentProjectId}
+                onFeatureChange={setRequirementFeatureId}
+                form={requirementForm}
+                setForm={setRequirementForm}
+                createWorkItem={createWorkItem}
+                item={currentItem}
+                analyzing={analyzingRequirement}
+                setActiveModule={openModule}
+                canCreate={canCreateDrafts}
+              />
+            )}
+            {activeModule === 'case-management' && <CaseManagement testCases={testCases} features={features} selectedCaseIds={selectedCaseIds} toggleCaseSelection={toggleCaseSelection} setAllVisibleCasesSelected={setAllVisibleCasesSelected} runSelectedCases={runSelectedCases} createSuiteFromSelection={createSuiteFromSelection} newSuiteName={newSuiteName} setNewSuiteName={setNewSuiteName} setActiveModule={openModule} bindCaseFeature={bindCaseFeature} deleteCase={deleteCase} deleteSelectedCases={deleteSelectedCases} scriptEditor={scriptEditor} openScriptEditor={openScriptEditor} closeScriptEditor={closeScriptEditor} updateScriptEditorContent={updateScriptEditorContent} saveScriptEditorDraft={saveScriptEditorDraft} canManageAssets={canManageAssets} canExecute={canExecute} canEditScripts={canCreateDrafts} />}
+            {activeModule === 'exploration' && <Exploration item={currentItem} exploration={exploration} explorationRun={explorationRun} explorationLogs={explorationLogs} browserStatus={browserStatus} browserStatusDetail={browserStatusDetail} liveConnected={liveConnected} browserCanvasRef={browserCanvasRef} setExploration={setExploration} updateElement={updateElement} addElement={addElement} setAllElementsConfirmed={setAllElementsConfirmed} saveExploration={saveExploration} runExploration={runExploration} exploring={exploring} sendBrowserCommand={sendBrowserCommand} handleBrowserClick={handleBrowserClick} handleBrowserMove={handleBrowserMove} handleBrowserWheel={handleBrowserWheel} handleBrowserKeyDown={handleBrowserKeyDown} canEdit={canCreateDrafts} />}
+            {activeModule === 'cases' && <Cases item={currentItem} casesMarkdown={casesMarkdown} setCasesMarkdown={setCasesMarkdown} generateCases={generateCases} assetMode={assetMode} setAssetMode={setAssetMode} canEdit={canCreateDrafts} />}
+            {activeModule === 'scripts' && <Scripts item={currentItem} latestRun={latestRun} scriptContent={scriptContent} setScriptContent={setScriptContent} generateScript={generateScript} saveArtifacts={saveArtifacts} assetMode={assetMode} canEdit={canCreateDrafts} canSaveArtifacts={canSaveArtifacts} />}
+            {activeModule === 'execution' && <Execution latestRun={latestRun} logs={logs} screenshot={screenshot} runCurrentItem={runCurrentItem} currentItem={currentItem} browserStatus={executionBrowserStatus} browserStatusDetail={executionBrowserDetail} liveConnected={executionLiveConnected} browserCanvasRef={executionBrowserCanvasRef} sendBrowserCommand={sendExecutionBrowserCommand} handleBrowserClick={handleExecutionBrowserClick} handleBrowserMove={handleExecutionBrowserMove} handleBrowserWheel={handleExecutionBrowserWheel} handleBrowserKeyDown={handleExecutionBrowserKeyDown} canExecute={canExecute} />}
+            {activeModule === 'healing' && <Healing item={currentItem} form={healingForm} setForm={setHealingForm} recordHealing={recordHealing} canEdit={canCreateDrafts} />}
+            {activeModule === 'delivery' && <Delivery item={currentItem} projects={projects} currentProjectId={currentProjectId} deliveryReport={deliveryReport} deliveryFilters={deliveryFilters} setDeliveryFilters={setDeliveryFilters} loadDeliveryReport={loadDeliveryReport} fetchJson={fetchJson} />}
           </div>
         </section>
       </section>
@@ -2400,6 +3285,8 @@ function ModuleTabs({
   menuOpen,
   setMenuOpen,
   menuRef,
+  tabsRef,
+  activeTabRef,
 }) {
   const activeIndex = tabs.indexOf(activeModule);
   const hasClosableTabs = tabs.some((moduleId) => moduleId !== HOME_MODULE_ID);
@@ -2417,14 +3304,14 @@ function ModuleTabs({
 
   return (
     <div className="module-tab-strip" aria-label="已打开菜单页签">
-      <div className="module-tabs" role="tablist" aria-label="已打开菜单">
+      <div className="module-tabs" role="tablist" aria-label="已打开菜单" ref={tabsRef}>
         {tabs.map((moduleId) => {
           const module = MODULE_LOOKUP[moduleId];
           if (!module) return null;
           const Icon = module.icon;
           const active = moduleId === activeModule;
           return (
-            <div className={active ? 'module-tab active' : 'module-tab'} key={moduleId}>
+            <div className={active ? 'module-tab active' : 'module-tab'} key={moduleId} ref={active ? activeTabRef : null}>
               <button
                 type="button"
                 className="module-tab-main"
@@ -2481,73 +3368,116 @@ function ModuleTabs({
   );
 }
 
-function AIConfig({ health, aiConfig, setAiConfig, saveAIConfig, clearAIConfig, testAIConfig, testingAIConfig }) {
+function AIConfig({
+  health,
+  aiConfig,
+  setAiConfig,
+  saveAIConfig,
+  clearAIConfig,
+  testAIConfig,
+  testingAIConfig,
+  newAIConfig,
+  selectAIProfile,
+  activateAIProfile,
+  deleteAIProfile,
+  aiSecretVisible,
+  revealAISecret,
+  copyAISecret,
+}) {
+  const profiles = health.ai?.profiles || [];
+  const activeProfileId = health.ai?.activeProfileId || health.ai?.profileId || '';
+  const editingSavedProfile = profiles.find((profile) => profile.id === aiConfig.id);
+  const isEditingActive = Boolean(aiConfig.id && aiConfig.id === activeProfileId);
   return (
     <section className="module-section" aria-label="AI 配置">
       <div className="section-header">
         <div>
-          <h2>AI 生成配置</h2>
-          <p>在前端录入 OpenAI-compatible API Key、模型和 Base URL；健康接口只返回掩码，不回传明文。</p>
+          <h2>AI 多厂商配置</h2>
+          <p>保存多个AI配置，在生成测试用例、脚本和自愈时切换当前模型。</p>
         </div>
         <div className="action-row">
-          <button type="button" className="ghost-button" onClick={testAIConfig} disabled={testingAIConfig}>
-            <RadioTower size={17} />
-            {testingAIConfig ? '测试中...' : '测试连接'}
+          <button type="button" className="ghost-button" onClick={newAIConfig}>
+            <Plus size={17} />
+            新建配置
           </button>
-          <button type="button" className="ghost-button" onClick={clearAIConfig} disabled={health.ai?.envLocked}>
+          <button type="button" className="ghost-button danger-action" onClick={() => deleteAIProfile(aiConfig.id)} disabled={!aiConfig.id}>
+            <Trash2 size={17} />
+            删除配置
+          </button>
+          <button type="button" className="ghost-button" onClick={clearAIConfig} disabled={health.ai?.envLocked && health.ai?.baseUrlLocked}>
             <XCircle size={17} />
-            清除本地配置
+            清除本地全部
           </button>
           <button type="button" className="primary-action" onClick={saveAIConfig}>
             <Save size={17} />
-            保存 AI 配置
+            保存配置
           </button>
         </div>
       </div>
-      <div className="split-grid">
-        <div className="data-panel">
-          <h3>当前状态</h3>
-          <div className="delivery-row">
-            <span>状态</span>
-            <strong>{health.ai?.configured ? '已配置' : '未配置'}</strong>
+      <div className="ai-config-layout">
+        <aside className="data-panel ai-profile-list" aria-label="AI 配置列表">
+          <div className="panel-heading">
+            <h3>配置列表</h3>
+            <span className="source-chip">{profiles.length} 个</span>
           </div>
-          <div className="delivery-row">
-            <span>来源</span>
-            <strong>{health.ai?.source === 'env' ? '环境变量' : health.ai?.source === 'local' ? '前端本地配置' : '无'}</strong>
-          </div>
-          <div className="delivery-row">
-            <span>模型</span>
-            <strong>{health.ai?.model || 'gpt-4.1-mini'}</strong>
-          </div>
-          <div className="delivery-row">
-            <span>调用地址</span>
-            <strong>{health.ai?.baseUrl || 'https://api.openai.com/v1'}</strong>
-          </div>
-          <div className="delivery-row">
-            <span>URL 来源</span>
-            <strong>{health.ai?.baseUrlSource === 'env' ? '环境变量' : health.ai?.baseUrlSource === 'local' ? '前端本地配置' : '默认值'}</strong>
-          </div>
-          <div className="delivery-row">
-            <span>连接状态</span>
-            <strong>{health.ai?.connectionStatus === 'connected' ? '测试通过' : '待测试'}</strong>
-          </div>
-          <div className="delivery-row">
-            <span>密钥</span>
-            <strong>{health.ai?.maskedKey || '未保存'}</strong>
-          </div>
-        </div>
+          {profiles.length ? (
+            <div className="ai-profile-items">
+              {profiles.map((profile) => (
+                <button
+                  type="button"
+                  className={`ai-profile-card ${profile.id === aiConfig.id ? 'selected' : ''}`}
+                  onClick={() => selectAIProfile(profile)}
+                  key={profile.id}
+                >
+                  <span>
+                    <strong>{profile.name}</strong>
+                    <small>{aiProviderLabel(profile.provider)} · {profile.model}</small>
+                  </span>
+                  {profile.id === activeProfileId && <b>当前</b>}
+                </button>
+              ))}
+            </div>
+          ) : (
+            <p className="muted">暂无本地配置。</p>
+          )}
+        </aside>
+
         <div className="data-panel">
           <h3>配置表单</h3>
           <div className="form-grid compact">
             <label className="field wide">
-              <span>OpenAI API Key</span>
+              <span>配置名称</span>
               <input
-                type="password"
-                value={aiConfig.api_key}
-                placeholder={health.ai?.envLocked ? '已由环境变量配置，前端不可覆盖' : 'sk-...'}
-                disabled={health.ai?.envLocked}
-                onChange={(event) => setAiConfig({ ...aiConfig, api_key: event.target.value })}
+                value={aiConfig.name}
+                placeholder="例如：DeepSeek 生产网关"
+                onChange={(event) => setAiConfig({ ...aiConfig, name: event.target.value })}
               />
+            </label>
+            <label className="field wide">
+              <span>厂商</span>
+              <select value={aiConfig.provider} onChange={(event) => setAiConfig({ ...aiConfig, provider: event.target.value })}>
+                {AI_PROVIDER_OPTIONS.map((provider) => (
+                  <option value={provider.value} key={provider.value}>{provider.label}</option>
+                ))}
+              </select>
+            </label>
+            <label className="field wide">
+              <span>API Key</span>
+              <div className="secret-input-row">
+                <input
+                  type={aiSecretVisible ? 'text' : 'password'}
+                  value={aiConfig.api_key}
+                  placeholder={health.ai?.envLocked ? '已由环境变量配置，前端不可覆盖' : editingSavedProfile?.maskedKey || 'sk-...'}
+                  disabled={health.ai?.envLocked}
+                  onChange={(event) => setAiConfig({ ...aiConfig, api_key: event.target.value })}
+                />
+                <button type="button" className="icon-button" title={aiSecretVisible ? '隐藏密钥' : '显示密钥'} onClick={revealAISecret} disabled={health.ai?.envLocked}>
+                  {aiSecretVisible ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+                <button type="button" className="icon-button" title="复制密钥" onClick={copyAISecret} disabled={health.ai?.envLocked}>
+                  <Copy size={16} />
+                </button>
+              </div>
             </label>
             <label className="field wide">
               <span>模型</span>
@@ -2557,20 +3487,532 @@ function AIConfig({ health, aiConfig, setAiConfig, saveAIConfig, clearAIConfig, 
               <span>Base URL</span>
               <input
                 value={aiConfig.base_url}
-                placeholder="https://api.openai.com/v1"
+                placeholder={DEFAULT_AI_BASE_URL}
                 disabled={health.ai?.baseUrlLocked}
                 onChange={(event) => setAiConfig({ ...aiConfig, base_url: event.target.value })}
               />
             </label>
           </div>
-          <p className="muted">如果服务启动时已设置 `OPENAI_API_KEY` 或 `OPENAI_BASE_URL`，平台会优先使用环境变量；测试连接会执行一次极短真实生成。</p>
+          <div className="action-row ai-form-actions">
+            <button type="button" className="ghost-button" onClick={() => activateAIProfile(aiConfig.id)} disabled={!aiConfig.id || isEditingActive}>
+              <CheckCircle2 size={17} />
+              设为当前
+            </button>
+            <button type="button" className="ghost-button" onClick={testAIConfig} disabled={testingAIConfig}>
+              <RadioTower size={17} />
+              {testingAIConfig ? '测试中...' : '测试连接'}
+            </button>
+            <button type="button" className="primary-action" onClick={saveAIConfig}>
+              <Save size={17} />
+              保存并启用
+            </button>
+          </div>
         </div>
       </div>
     </section>
   );
 }
 
-function TopbarActions({ health, error, notice, latestRun, automationStatus, automationStage, themes, themeId, setThemeId, onLocalLogout }) {
+function AuthWorkspaceHero() {
+  const highlights = [
+    { icon: ClipboardList, title: '需求分析与项目预检', description: '自动抽取测试目标、角色、数据与验收标准，并检查 Playwright 配置和项目约定。', tone: 'teal' },
+    { icon: FlaskConical, title: '用例设计与页面探索', description: '沉淀可追溯测试用例，调起实时浏览器采集页面结构、截图、日志和候选元素。', tone: 'blue' },
+    { icon: MonitorPlay, title: '脚本生成与运行验证', description: 'AI 或人工编辑 Playwright 脚本，执行草稿 spec，展示实时日志、报告和历史结果。', tone: 'indigo' },
+    { icon: Wand2, title: '自愈诊断与交付归档', description: '失败后记录修复尝试，验证通过后保存用例、spec、报告和运行证据。', tone: 'cyan' },
+  ];
+  const metrics = [
+    { value: '8 步', label: '自动化流程' },
+    { value: '实时', label: '浏览器探索画面' },
+    { value: '可追溯', label: '验证产物归档' },
+  ];
+
+  return (
+    <aside className="auth-hero" aria-label="平台品牌">
+      <div className="auth-brand">
+        <span className="auth-brand-mark"><AuthPlatformLogo /></span>
+        <strong>Web 自动化测试平台</strong>
+        <span>AI-Powered Automation Platform</span>
+      </div>
+      <div className="auth-hero-copy">
+        <h2>
+          <span>从需求到交付</span>
+          <span>自动化测试闭环</span>
+        </h2>
+        <p>面向本地自动化测试场景，串联需求分析、项目预检、用例设计、页面探索、脚本实现、运行验证、自愈诊断和交付报告，让 Playwright 测试从草稿到已验证产物全程可追踪。</p>
+      </div>
+      <div className="auth-feature-list" aria-label="平台能力">
+        {highlights.map((item) => {
+          const Icon = item.icon;
+          return (
+            <div className="auth-feature-item" key={item.title}>
+              <span className={`auth-feature-icon ${item.tone}`}><Icon size={19} /></span>
+              <span>
+                <strong>{item.title}</strong>
+                <small>{item.description}</small>
+              </span>
+            </div>
+          );
+        })}
+      </div>
+      <div className="auth-metric-strip" aria-label="平台指标">
+        {metrics.map((item) => (
+          <div className="auth-metric" key={item.label}>
+            <strong>{item.value}</strong>
+            <span>{item.label}</span>
+          </div>
+        ))}
+      </div>
+    </aside>
+  );
+}
+
+function AuthPlatformLogo() {
+  return (
+    <svg className="auth-platform-logo" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+      <rect className="logo-browser" x="7" y="10" width="34" height="28" rx="6" />
+      <path className="logo-browser-bar" d="M8 18h32" />
+      <circle className="logo-dot logo-dot-muted" cx="14" cy="14" r="1.5" />
+      <circle className="logo-dot logo-dot-muted" cx="19" cy="14" r="1.5" />
+      <path className="logo-code-line" d="M15 25h7" />
+      <path className="logo-code-line" d="M15 31h10" />
+      <path className="logo-flow-line" d="M24 25h5.8c2.3 0 4.2 1.9 4.2 4.2v.1" />
+      <circle className="logo-node" cx="24" cy="25" r="3" />
+      <circle className="logo-node logo-node-end" cx="34" cy="31" r="3.5" />
+      <path className="logo-check" d="m31.8 31.1 1.5 1.5 3.3-3.7" />
+      <path className="logo-cursor" d="M29 20.5 34.8 23 30.4 25.2z" />
+    </svg>
+  );
+}
+
+function AuthGate({
+  mode,
+  setMode,
+  clearAuthFeedback,
+  loginForm,
+  setLoginForm,
+  registerForm,
+  setRegisterForm,
+  submitLogin,
+  submitRegister,
+  submitting,
+  error,
+  message,
+  themeId,
+}) {
+  const isRegister = mode === 'register';
+  const [passwordVisible, setPasswordVisible] = useState(false);
+  const handleSubmit = (event) => {
+    event.preventDefault();
+    if (isRegister) submitRegister();
+    else submitLogin();
+  };
+  const handleModeSwitch = () => {
+    clearAuthFeedback();
+    setPasswordVisible(false);
+    setMode(isRegister ? 'login' : 'register');
+  };
+
+  return (
+    <main className="auth-shell" data-theme={themeId}>
+      <section className="auth-panel auth-layout" aria-label={isRegister ? '注册账号' : '登录平台'} data-testid="auth-panel">
+        <AuthWorkspaceHero />
+        <div className="auth-card">
+          <div className="auth-card-surface">
+            <div className="auth-card-header">
+              <span className="auth-card-logo"><AuthPlatformLogo /></span>
+              <h1>{isRegister ? '申请平台账号' : '欢迎回来'}</h1>
+              <p>{isRegister ? '提交账号后等待管理员审核启用' : '登录到 API 智能测试平台，开始您的测试之旅'}</p>
+            </div>
+            <form className="auth-form" onSubmit={handleSubmit}>
+              <label className="field wide">
+                <span>登录名</span>
+                <div className="auth-input-wrap">
+                  <UserCog size={17} />
+                  <input
+                    value={isRegister ? registerForm.username : loginForm.username}
+                    autoComplete="username"
+                    placeholder="请输入登录名"
+                    inputMode="text"
+                    onChange={(event) => (isRegister
+                      ? setRegisterForm({ ...registerForm, username: event.target.value })
+                      : setLoginForm({ ...loginForm, username: event.target.value }))}
+                  />
+                </div>
+                {isRegister && <small className="auth-field-hint">3-32 位，可使用字母、数字、点、下划线或短横线。</small>}
+              </label>
+              {isRegister && (
+                <label className="field wide">
+                  <span>昵称</span>
+                  <div className="auth-input-wrap">
+                    <Sparkles size={17} />
+                    <input
+                      value={registerForm.display_name}
+                      placeholder="请输入团队内显示名称"
+                      onChange={(event) => setRegisterForm({ ...registerForm, display_name: event.target.value })}
+                    />
+                  </div>
+                </label>
+              )}
+              <label className="field wide">
+                <span>密码</span>
+                <div className="auth-input-wrap">
+                  <Lock size={17} />
+                  <input
+                    type={passwordVisible ? 'text' : 'password'}
+                    value={isRegister ? registerForm.password : loginForm.password}
+                    autoComplete={isRegister ? 'new-password' : 'current-password'}
+                    placeholder={isRegister ? '至少 8 位，包含字母和数字' : '请输入密码'}
+                    onChange={(event) => (isRegister
+                      ? setRegisterForm({ ...registerForm, password: event.target.value })
+                      : setLoginForm({ ...loginForm, password: event.target.value }))}
+                  />
+                  <button
+                    type="button"
+                    className="auth-password-toggle"
+                    aria-label={passwordVisible ? '隐藏密码' : '显示密码'}
+                    aria-pressed={passwordVisible}
+                    onClick={() => setPasswordVisible((visible) => !visible)}
+                  >
+                    {passwordVisible ? <EyeOff size={18} /> : <Eye size={18} />}
+                  </button>
+                </div>
+                {isRegister && <small className="auth-field-hint">至少 8 位，并包含字母和数字。</small>}
+              </label>
+              {error && <div className="auth-message danger" role="alert">{error}</div>}
+              {message && <div className="auth-message success" role="status">{message}</div>}
+              <button type="submit" className="primary-action auth-submit" disabled={submitting}>
+                {submitting ? <RefreshCw className="auth-submit-spinner" size={17} /> : <Sparkles size={17} />}
+                {submitting ? '处理中...' : isRegister ? '提交注册' : '登录'}
+              </button>
+            </form>
+            <button type="button" className="auth-switch" onClick={handleModeSwitch}>
+              {isRegister ? '已有账号，返回登录' : '还没有账号？ 立即注册'}
+            </button>
+            {!isRegister && (
+              <div className="auth-default-account" aria-label="默认管理员账号">
+                <Sparkles size={14} />
+                <span>默认管理员账号: <strong>admin / admin123456</strong></span>
+              </div>
+            )}
+          </div>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function UserManagement({ users, loadUsers, createUser, updateUser, deleteUser, resetUserPassword, message }) {
+  const emptyForm = { username: '', display_name: '', password: '', role: 'viewer', status: 'active' };
+  const [createForm, setCreateForm] = useState(emptyForm);
+  const [selectedUserId, setSelectedUserId] = useState('');
+  const [detailMode, setDetailMode] = useState('view');
+  const [editForm, setEditForm] = useState({ display_name: '', role: 'viewer', status: 'active' });
+  const [query, setQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [roleFilter, setRoleFilter] = useState('all');
+  const selectedUser = users.find((user) => user.id === selectedUserId) || users[0] || null;
+  const visibleUsers = users.filter((user) => {
+    const haystack = `${user.username} ${user.displayName || ''}`.toLowerCase();
+    const matchesQuery = !query.trim() || haystack.includes(query.trim().toLowerCase());
+    const matchesStatus = statusFilter === 'all' || user.status === statusFilter;
+    const matchesRole = roleFilter === 'all' || user.role === roleFilter;
+    return matchesQuery && matchesStatus && matchesRole;
+  });
+  const protectedAdmin = selectedUser?.username === 'admin';
+  const filteredEmpty = Boolean(users.length && !visibleUsers.length);
+
+  useEffect(() => {
+    if (!users.length) {
+      setSelectedUserId('');
+      setDetailMode('view');
+      return;
+    }
+    if (!selectedUserId || !users.some((user) => user.id === selectedUserId)) {
+      setSelectedUserId(users[0].id);
+      setDetailMode('view');
+    }
+  }, [users, selectedUserId]);
+
+  async function submitCreateUser(event) {
+    event.preventDefault();
+    const created = await createUser(createForm);
+    if (created) {
+      setCreateForm(emptyForm);
+      setSelectedUserId(created.id);
+      setDetailMode('view');
+    }
+  }
+
+  function beginEdit(user) {
+    setSelectedUserId(user.id);
+    setDetailMode('edit');
+    setEditForm({
+      display_name: user.displayName || user.username,
+      role: user.role,
+      status: user.status,
+    });
+  }
+
+  async function saveEdit() {
+    if (!selectedUser) return;
+    const updated = await updateUser(selectedUser.id, editForm);
+    if (updated) {
+      setSelectedUserId(updated.id);
+      setDetailMode('view');
+    }
+  }
+
+  async function updateSelectedUser(patch) {
+    if (!selectedUser) return;
+    const updated = await updateUser(selectedUser.id, patch);
+    if (updated) setSelectedUserId(updated.id);
+  }
+
+  function confirmDelete(user) {
+    if (window.confirm(`确认删除用户 ${user.username}？删除后该账号将无法登录。`)) {
+      deleteUser(user.id);
+      setSelectedUserId((currentId) => (currentId === user.id ? '' : currentId));
+      setDetailMode('view');
+    }
+  }
+
+  function selectUser(user) {
+    setSelectedUserId(user.id);
+    setDetailMode('view');
+  }
+
+  function renderStatusBadge(status) {
+    return <span className={`user-status-badge ${status}`}>{STATUS_LABELS[status] || status}</span>;
+  }
+
+  function renderListRow(user) {
+    const isSelected = user.id === selectedUser?.id && detailMode !== 'create';
+    const rowProtected = user.username === 'admin';
+    return (
+      <button
+        type="button"
+        className={isSelected ? 'user-list-row selected' : 'user-list-row'}
+        onClick={() => selectUser(user)}
+        key={user.id}
+      >
+        <div className="user-list-identity">
+          <strong>{user.displayName || user.username}</strong>
+          <span>{user.username}</span>
+        </div>
+        <span>{ROLE_LABELS[user.role] || user.role}</span>
+        {renderStatusBadge(user.status)}
+        <span>{formatDateTime(user.lastLoginAt)}</span>
+        <span>{formatDateTime(user.updatedAt)}</span>
+        <span>{rowProtected ? '受保护' : '-'}</span>
+      </button>
+    );
+  }
+
+  function renderCreatePanel() {
+    return (
+      <form className="user-detail-form" onSubmit={submitCreateUser}>
+        <div className="panel-heading">
+          <h3>新建用户</h3>
+          <button type="button" className="ghost-button compact" onClick={() => setDetailMode('view')}>取消</button>
+        </div>
+        <div className="form-grid compact">
+          <label className="field wide">
+            <span>账号</span>
+            <input value={createForm.username} onChange={(event) => setCreateForm({ ...createForm, username: event.target.value })} />
+          </label>
+          <label className="field wide">
+            <span>昵称</span>
+            <input value={createForm.display_name} onChange={(event) => setCreateForm({ ...createForm, display_name: event.target.value })} />
+          </label>
+          <label className="field wide">
+            <span>初始密码</span>
+            <input type="password" value={createForm.password} onChange={(event) => setCreateForm({ ...createForm, password: event.target.value })} />
+          </label>
+          <label className="field wide">
+            <span>角色</span>
+            <select value={createForm.role} onChange={(event) => setCreateForm({ ...createForm, role: event.target.value })}>
+              {Object.entries(ROLE_LABELS).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+            </select>
+          </label>
+          <label className="field wide">
+            <span>状态</span>
+            <select value={createForm.status} onChange={(event) => setCreateForm({ ...createForm, status: event.target.value })}>
+              {Object.entries(STATUS_LABELS).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+            </select>
+          </label>
+        </div>
+        <button type="submit" className="primary-action user-detail-submit">
+          <Plus size={17} />
+          创建用户
+        </button>
+      </form>
+    );
+  }
+
+  function renderDetailPanel() {
+    if (detailMode === 'create') return renderCreatePanel();
+    if (!selectedUser) {
+      return <p className="muted">暂无用户。</p>;
+    }
+    if (detailMode === 'edit') {
+      return (
+        <div className="user-detail-form">
+          <div className="panel-heading">
+            <h3>编辑用户</h3>
+            <button type="button" className="ghost-button compact" onClick={() => setDetailMode('view')}>取消</button>
+          </div>
+          <div className="form-grid compact">
+            <label className="field wide">
+              <span>账号</span>
+              <input value={selectedUser.username} disabled />
+            </label>
+            <label className="field wide">
+              <span>昵称</span>
+              <input value={editForm.display_name} onChange={(event) => setEditForm({ ...editForm, display_name: event.target.value })} />
+            </label>
+            <label className="field wide">
+              <span>角色</span>
+              <select value={editForm.role} disabled={protectedAdmin} onChange={(event) => setEditForm({ ...editForm, role: event.target.value })}>
+                {Object.entries(ROLE_LABELS).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+              </select>
+            </label>
+            <label className="field wide">
+              <span>状态</span>
+              <select value={editForm.status} disabled={protectedAdmin} onChange={(event) => setEditForm({ ...editForm, status: event.target.value })}>
+                {Object.entries(STATUS_LABELS).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+              </select>
+            </label>
+          </div>
+          {protectedAdmin && <div className="user-protected-note">默认管理员受保护，不能禁用、删除或降级。</div>}
+          <button type="button" className="primary-action user-detail-submit" onClick={saveEdit}>
+            <Save size={17} />
+            保存修改
+          </button>
+        </div>
+      );
+    }
+    return (
+      <div className="user-detail-view">
+        <div className="panel-heading">
+          <h3>用户详情</h3>
+          {renderStatusBadge(selectedUser.status)}
+        </div>
+        <div className="user-detail-identity">
+          <strong>{selectedUser.displayName || selectedUser.username}</strong>
+          <span>{selectedUser.username}</span>
+          {protectedAdmin && <b>默认管理员受保护</b>}
+        </div>
+        <dl className="user-detail-meta">
+          <div><dt>角色</dt><dd>{ROLE_LABELS[selectedUser.role] || selectedUser.role}</dd></div>
+          <div><dt>状态</dt><dd>{STATUS_LABELS[selectedUser.status] || selectedUser.status}</dd></div>
+          <div><dt>最近登录</dt><dd>{formatDateTime(selectedUser.lastLoginAt)}</dd></div>
+          <div><dt>创建时间</dt><dd>{formatDateTime(selectedUser.createdAt)}</dd></div>
+          <div><dt>更新时间</dt><dd>{formatDateTime(selectedUser.updatedAt)}</dd></div>
+        </dl>
+        {protectedAdmin && <div className="user-protected-note">默认管理员账号用于系统兜底登录，危险操作已禁用。</div>}
+        <div className="user-detail-actions">
+          {selectedUser.status !== 'active' && (
+            <button type="button" className="ghost-button" onClick={() => updateSelectedUser({ status: 'active' })}>启用</button>
+          )}
+          {selectedUser.status !== 'disabled' && (
+            <button type="button" className="ghost-button danger-button" onClick={() => updateSelectedUser({ status: 'disabled' })} disabled={protectedAdmin}>禁用</button>
+          )}
+          <button type="button" className="ghost-button" onClick={() => beginEdit(selectedUser)}>
+            <Edit3 size={16} />
+            编辑
+          </button>
+          <button type="button" className="ghost-button" onClick={() => resetUserPassword(selectedUser.id)}>重置密码</button>
+          <button type="button" className="ghost-button danger-button" onClick={() => confirmDelete(selectedUser)} disabled={protectedAdmin}>
+            <Trash2 size={16} />
+            删除
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <section className="module-section" aria-label="用户管理">
+      <div className="section-header">
+        <div>
+          <h2>用户管理</h2>
+          <p>新增账号，审核注册用户，维护角色、状态和密码。</p>
+        </div>
+        <button type="button" className="ghost-button" onClick={loadUsers}>
+          <RefreshCw size={17} />
+          刷新
+        </button>
+      </div>
+      {message && <div className="notice-inline">{message}</div>}
+      <div className="user-management-workspace">
+        <section className="data-panel user-list-panel" aria-label="用户列表">
+          <div className="user-list-toolbar">
+            <label className="field user-search-field">
+              <span>搜索</span>
+              <input value={query} placeholder="账号或昵称" onChange={(event) => setQuery(event.target.value)} />
+            </label>
+            <label className="field">
+              <span>状态</span>
+              <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
+                <option value="all">全部状态</option>
+                {Object.entries(STATUS_LABELS).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+              </select>
+            </label>
+            <label className="field">
+              <span>角色</span>
+              <select value={roleFilter} onChange={(event) => setRoleFilter(event.target.value)}>
+                <option value="all">全部角色</option>
+                {Object.entries(ROLE_LABELS).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+              </select>
+            </label>
+            <button type="button" className="primary-action" onClick={() => setDetailMode('create')}>
+              <Plus size={17} />
+              新建用户
+            </button>
+          </div>
+          <div className="user-list-count">
+            <span>{visibleUsers.length} / {users.length} 个用户</span>
+          </div>
+          <div className="user-list-table" role="list">
+            <div className="user-list-row user-list-head">
+              <span>用户</span>
+              <span>角色</span>
+              <span>状态</span>
+              <span>最近登录</span>
+              <span>更新时间</span>
+              <span>保护</span>
+            </div>
+            {visibleUsers.map(renderListRow)}
+          </div>
+          {!users.length && <p className="muted user-empty-state">暂无用户。</p>}
+          {filteredEmpty && <p className="muted user-empty-state">没有符合条件的用户。</p>}
+        </section>
+        <aside className="data-panel user-detail-panel" aria-label="用户详情">
+          {renderDetailPanel()}
+        </aside>
+      </div>
+    </section>
+  );
+}
+
+function TopbarActions({
+  health,
+  error,
+  notice,
+  latestRun,
+  automationStatus,
+  automationStage,
+  themes,
+  themeId,
+  setThemeId,
+  user,
+  passwordPanelOpen,
+  setPasswordPanelOpen,
+  passwordForm,
+  setPasswordForm,
+  changePassword,
+  logout,
+}) {
   const [openPanel, setOpenPanel] = useState('');
   const actionsRef = useRef(null);
   const notifications = useMemo(() => {
@@ -2762,18 +4204,43 @@ function TopbarActions({ health, error, notice, latestRun, automationStatus, aut
         {openPanel === 'user' && (
           <section className="topbar-popover user-popover" role="dialog" aria-label="QA 用户菜单" data-testid="topbar-user-panel">
             <div className="topbar-user-card">
-              <span className="qa-avatar large">QA</span>
+              <span className="qa-avatar large">{(user?.displayName || user?.username || 'QA').slice(0, 2).toUpperCase()}</span>
               <div>
-                <strong>QA 用户</strong>
-                <span>本地工作台</span>
+                <strong>{user?.displayName || user?.username || 'QA 用户'}</strong>
+                <span>{ROLE_LABELS[user?.role] || user?.role || '已登录'}</span>
               </div>
             </div>
             <button
               type="button"
               className="user-menu-action"
+              onClick={() => setPasswordPanelOpen(!passwordPanelOpen)}
+            >
+              <Lock size={16} />
+              修改密码
+            </button>
+            {passwordPanelOpen && (
+              <div className="password-panel">
+                <input
+                  type="password"
+                  placeholder="当前密码"
+                  value={passwordForm.current_password}
+                  onChange={(event) => setPasswordForm({ ...passwordForm, current_password: event.target.value })}
+                />
+                <input
+                  type="password"
+                  placeholder="新密码"
+                  value={passwordForm.new_password}
+                  onChange={(event) => setPasswordForm({ ...passwordForm, new_password: event.target.value })}
+                />
+                <button type="button" className="primary-action" onClick={changePassword}>保存密码</button>
+              </div>
+            )}
+            <button
+              type="button"
+              className="user-menu-action"
               onClick={() => {
                 setOpenPanel('');
-                onLocalLogout();
+                logout();
               }}
             >
               <LogOut size={16} />
@@ -3133,16 +4600,26 @@ function Projects({ projects, setProjects, currentProjectId, setCurrentProjectId
   const projectCases = testCases.filter((item) => !currentProject || item.projectId === currentProject.id);
   const projectDeliverables = deliverables.filter((item) => !currentProject || item.projectId === currentProject.id);
   const projectRuns = suiteRuns.filter((item) => !currentProject || item.projectId === currentProject.id);
-  const [editingProjectId, setEditingProjectId] = useState(currentProject?.id || '');
+  const [editingProjectId, setEditingProjectId] = useState(currentProject?.id || 'new');
   const [projectForm, setProjectForm] = useState(() => emptyProjectForm(currentProject));
   const isCreating = editingProjectId === 'new';
-  const isDefaultProject = currentProject?.id === 'default-local-project';
 
   useEffect(() => {
     if (editingProjectId === 'new') return;
-    setEditingProjectId(currentProject?.id || '');
+    setEditingProjectId(currentProject?.id || 'new');
     setProjectForm(emptyProjectForm(currentProject));
   }, [currentProject?.id]);
+
+  useEffect(() => {
+    if (projects.length || editingProjectId === 'new') return;
+    setEditingProjectId('new');
+    setProjectForm(emptyProjectForm({
+      name: '我的 QA 项目',
+      projectType: 'delivery',
+      status: 'planning',
+      description: '用于管理需求、用例、交付物和批量执行的项目。',
+    }));
+  }, [editingProjectId, projects.length]);
 
   function updateProjectForm(key, value) {
     setProjectForm((previous) => ({ ...previous, [key]: value }));
@@ -3165,7 +4642,7 @@ function Projects({ projects, setProjects, currentProjectId, setCurrentProjectId
   }
 
   function cancelProjectEdit() {
-    setEditingProjectId(currentProject?.id || '');
+    setEditingProjectId(currentProject?.id || 'new');
     setProjectForm(emptyProjectForm(currentProject));
   }
 
@@ -3306,7 +4783,7 @@ function Projects({ projects, setProjects, currentProjectId, setCurrentProjectId
               取消
             </button>
             {!isCreating && currentProject && (
-              <button type="button" className="ghost-button danger-action" onClick={deleteProject} disabled={isDefaultProject}>
+              <button type="button" className="ghost-button danger-action" onClick={deleteProject}>
                 <Trash2 size={16} />
                 删除项目
               </button>
@@ -3354,7 +4831,10 @@ function TestSuites({
   const [casePriority, setCasePriority] = useState('all');
   const [casePage, setCasePage] = useState(1);
   const [listPanelWidth, setListPanelWidth] = useState(340);
+  const [caseTreePanelWidth, setCaseTreePanelWidth] = useState(320);
   const [listCollapsed, setListCollapsed] = useState(false);
+  const [expandedProjects, setExpandedProjects] = useState(() => new Set());
+  const [expandedFeatures, setExpandedFeatures] = useState(() => new Set());
   const casePageSize = 10;
   const normalizedSearch = search.trim().toLowerCase();
   const normalizedProjectSearch = projectSearch.trim().toLowerCase();
@@ -3374,7 +4854,7 @@ function TestSuites({
         ...project,
         testCases: project.testCases || [],
         features: project.features || [],
-        featureTree: project.featureTree || [],
+        featureTree: project.featureTree?.length ? project.featureTree : buildFeatureTree(project.features || []),
       }));
     }
     return projects.map((project) => ({
@@ -3409,7 +4889,9 @@ function TestSuites({
   const selectedCaseProjectIds = [...new Set(selectedCases.map((item) => item.projectId).filter(Boolean))];
   const selectedCaseProjectId = selectedCaseProjectIds.length === 1 ? selectedCaseProjectIds[0] : '';
   const existingSuiteProjectId = selectedSuiteId ? selectedSuite?.projectId || suiteForm.projectId : '';
-  const lockedProjectId = selectedCaseProjectId || existingSuiteProjectId;
+  const scopedProjectId = selectedScope.type !== 'all' ? selectedScope.projectId : '';
+  const existingSuiteHasCases = Boolean(selectedSuiteId && (selectedSuite?.caseCount || selectedSuite?.caseIds?.length || suiteForm.caseIds?.length));
+  const lockedProjectId = selectedCaseProjectId || (existingSuiteHasCases ? existingSuiteProjectId : scopedProjectId);
   const lockedProject = lockedProjectId ? projectById.get(lockedProjectId) : null;
   const formStats = suiteCaseStats({ caseIds: suiteForm.caseIds }, allProjectCases.length ? allProjectCases : testCases);
   const selectedSuiteCaseCount = selectedSuite?.caseCount ?? selectedSuite?.caseIds?.length ?? 0;
@@ -3431,7 +4913,7 @@ function TestSuites({
   });
   const filteredProjectIds = [...new Set(filteredCases.map((item) => item.projectId).filter(Boolean))];
   const filteredSelectionProjectId = lockedProjectId
-    || (selectedScope.type !== 'all' ? selectedScope.projectId : filteredProjectIds.length === 1 ? filteredProjectIds[0] : '');
+    || (scopedProjectId || (filteredProjectIds.length === 1 ? filteredProjectIds[0] : ''));
   const canBulkSelectFiltered = Boolean(filteredSelectionProjectId);
   const caseTotalPages = Math.max(1, Math.ceil(filteredCases.length / casePageSize));
   const currentCasePage = Math.min(casePage, caseTotalPages);
@@ -3448,6 +4930,7 @@ function TestSuites({
     if (patch.frequency && patch.frequency !== 'off') next.enabled = true;
     return { ...form, scheduleConfig: next };
   });
+  const fallbackProjectId = (form) => filteredSelectionProjectId || scopedProjectId || selectedSuite?.projectId || form.projectId || currentProjectId;
   const toggleSuiteCase = (item, selected) => {
     if (!suiteEditing) return;
     if (selected && lockedProjectId && lockedProjectId !== item.projectId) {
@@ -3458,7 +4941,7 @@ function TestSuites({
       if (selected) next.add(item.id);
       else next.delete(item.id);
       const remainingCases = Array.from(next).map((caseId) => casesById.get(caseId)).filter(Boolean);
-      const nextProjectId = remainingCases[0]?.projectId || (selectedSuiteId ? selectedSuite?.projectId || form.projectId : currentProjectId);
+      const nextProjectId = remainingCases[0]?.projectId || fallbackProjectId(form);
       return { ...form, projectId: nextProjectId, caseIds: Array.from(next) };
     });
   };
@@ -3480,7 +4963,7 @@ function TestSuites({
       const next = new Set(form.caseIds || []);
       filteredCases.forEach((item) => next.delete(item.id));
       const remainingCases = Array.from(next).map((caseId) => casesById.get(caseId)).filter(Boolean);
-      const nextProjectId = remainingCases[0]?.projectId || (selectedSuiteId ? selectedSuite?.projectId || form.projectId : currentProjectId);
+      const nextProjectId = remainingCases[0]?.projectId || fallbackProjectId(form);
       return { ...form, projectId: nextProjectId, caseIds: Array.from(next) };
     });
   };
@@ -3488,24 +4971,58 @@ function TestSuites({
     const featureIds = new Set(collectFeatureIds(feature));
     return (project.testCases || []).filter((item) => featureIds.has(item.featureId)).length;
   };
+  const toggleProjectExpanded = (projectId) => {
+    setExpandedProjects((current) => {
+      const next = new Set(current);
+      if (next.has(projectId)) next.delete(projectId);
+      else next.add(projectId);
+      return next;
+    });
+  };
+  const toggleFeatureExpanded = (featureId) => {
+    setExpandedFeatures((current) => {
+      const next = new Set(current);
+      if (next.has(featureId)) next.delete(featureId);
+      else next.add(featureId);
+      return next;
+    });
+  };
   const renderFeaturePickerNode = (project, feature, depth = 0) => {
     const isSelected = selectedScope.type === 'feature' && selectedScope.featureId === feature.id;
+    const hasChildren = Boolean(feature.children?.length);
+    const isExpanded = expandedFeatures.has(feature.id);
     return (
       <div className="suite-feature-node-wrap" key={feature.id}>
         <button
           type="button"
-          className={isSelected ? 'suite-feature-node selected' : 'suite-feature-node'}
+          className={[
+            'suite-feature-node',
+            isSelected ? 'selected' : '',
+            !feature.isActive ? 'disabled-feature' : '',
+          ].filter(Boolean).join(' ')}
           style={{ '--feature-depth': depth }}
           onClick={() => setSelectedScope({ type: 'feature', projectId: project.id, featureId: feature.id, featureIds: collectFeatureIds(feature) })}
+          aria-expanded={hasChildren ? isExpanded : undefined}
         >
-          <CircleDot size={13} />
+          <span
+            className={hasChildren ? 'suite-tree-toggle' : 'suite-tree-toggle placeholder'}
+            role="button"
+            tabIndex={-1}
+            aria-label={isExpanded ? `收起${feature.name}` : `展开${feature.name}`}
+            onClick={(event) => {
+              event.stopPropagation();
+              if (hasChildren) toggleFeatureExpanded(feature.id);
+            }}
+          >
+            {hasChildren ? <ChevronDown size={14} /> : <CircleDot size={10} />}
+          </span>
           <span>
             <strong>{feature.name}</strong>
             <small>{feature.path}</small>
           </span>
           <em>{featureCaseCount(project, feature)} 条</em>
         </button>
-        {feature.children?.length ? (
+        {hasChildren && isExpanded ? (
           <div className="suite-feature-children">
             {feature.children.map((child) => renderFeaturePickerNode(project, child, depth + 1))}
           </div>
@@ -3521,6 +5038,21 @@ function TestSuites({
     const handleMove = (moveEvent) => {
       const nextWidth = Math.min(560, Math.max(260, startWidth + moveEvent.clientX - startX));
       setListPanelWidth(nextWidth);
+    };
+    const stopResize = () => {
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', stopResize);
+    };
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', stopResize);
+  };
+  const startCaseTreeResize = (event) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = caseTreePanelWidth;
+    const handleMove = (moveEvent) => {
+      const nextWidth = Math.min(520, Math.max(240, startWidth + moveEvent.clientX - startX));
+      setCaseTreePanelWidth(nextWidth);
     };
     const stopResize = () => {
       window.removeEventListener('pointermove', handleMove);
@@ -3766,7 +5298,10 @@ function TestSuites({
                   <h3>选择测试用例</h3>
                   <span className="muted">已选 {selectedIds.size} · {lockedProject ? lockedProject.name : '未锁定项目'}</span>
                 </div>
-                <div className="suite-case-picker">
+                <div
+                  className="suite-case-picker"
+                  style={{ '--suite-case-tree-width': `${caseTreePanelWidth}px` }}
+                >
                   <aside className="suite-case-tree-panel">
                     <label className="search-field">
                       <Search size={15} />
@@ -3785,33 +5320,58 @@ function TestSuites({
                       <em>{allProjectCases.filter((item) => visibleProjectIds.has(item.projectId)).length} 条</em>
                     </button>
                     <div className="suite-project-tree">
-                      {visibleSuiteProjects.length ? visibleSuiteProjects.map((project) => (
-                        <article className="suite-project-group" key={project.id}>
-                          <button
-                            type="button"
-                            className={selectedScope.type === 'project' && selectedScope.projectId === project.id ? 'suite-project-node selected' : 'suite-project-node'}
-                            onClick={() => setSelectedScope({ type: 'project', projectId: project.id, featureId: '', featureIds: [] })}
-                          >
-                            <FolderTree size={15} />
-                            <span>
-                              <strong>{project.name}</strong>
-                              <small>{project.projectCode || project.id}</small>
-                            </span>
-                            <em>{project.testCases?.length || 0} 条</em>
-                          </button>
-                          {project.featureTree?.length ? (
-                            <div className="suite-feature-tree">
-                              {project.featureTree.map((feature) => renderFeaturePickerNode(project, feature))}
-                            </div>
-                          ) : project.suiteCaseLoadError ? (
-                            <p className="muted suite-tree-empty">用例加载失败：{project.suiteCaseLoadError}</p>
-                          ) : (
-                            <p className="muted suite-tree-empty">暂无功能树</p>
-                          )}
-                        </article>
-                      )) : <p className="muted suite-tree-empty">没有匹配的项目。</p>}
+                      {visibleSuiteProjects.length ? visibleSuiteProjects.map((project) => {
+                        const hasFeatureTree = Boolean(project.featureTree?.length);
+                        const projectExpanded = expandedProjects.has(project.id);
+                        return (
+                          <article className="suite-project-group" key={project.id}>
+                            <button
+                              type="button"
+                              className={selectedScope.type === 'project' && selectedScope.projectId === project.id ? 'suite-project-node selected' : 'suite-project-node'}
+                              onClick={() => setSelectedScope({ type: 'project', projectId: project.id, featureId: '', featureIds: [] })}
+                              aria-expanded={hasFeatureTree ? projectExpanded : undefined}
+                            >
+                              <span
+                                className={hasFeatureTree ? 'suite-tree-toggle' : 'suite-tree-toggle placeholder'}
+                                role="button"
+                                tabIndex={-1}
+                                aria-label={projectExpanded ? `收起${project.name}` : `展开${project.name}`}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  if (hasFeatureTree) toggleProjectExpanded(project.id);
+                                }}
+                              >
+                                {hasFeatureTree ? <ChevronDown size={14} /> : <FolderTree size={14} />}
+                              </span>
+                              <span>
+                                <strong>{project.name}</strong>
+                                <small>{project.projectCode || project.id}</small>
+                              </span>
+                              <em>{project.testCases?.length || 0} 条</em>
+                            </button>
+                            {projectExpanded ? (
+                              hasFeatureTree ? (
+                                <div className="suite-feature-tree">
+                                  {project.featureTree.map((feature) => renderFeaturePickerNode(project, feature, 1))}
+                                </div>
+                              ) : project.suiteCaseLoadError ? (
+                                <p className="muted suite-tree-empty">用例加载失败：{project.suiteCaseLoadError}</p>
+                              ) : (
+                                <p className="muted suite-tree-empty">暂无功能树</p>
+                              )
+                            ) : null}
+                          </article>
+                        );
+                      }) : <p className="muted suite-tree-empty">没有匹配的项目。</p>}
                     </div>
                   </aside>
+                  <button
+                    type="button"
+                    className="suite-case-resize-handle"
+                    aria-label="调整功能树宽度"
+                    title="拖拽调整功能树宽度"
+                    onPointerDown={startCaseTreeResize}
+                  />
                   <div className="suite-case-list-panel">
                     <div className="suite-picker-summary">
                       <span>{selectedScopeLabel}</span>
@@ -3945,6 +5505,10 @@ function FeatureMenus({ projects, currentProjectId, setCurrentProjectId, feature
   }, [selectedFeature?.id, selectedFeature?.updatedAt, mode]);
 
   const beginCreate = (parentId = '') => {
+    if (!currentProjectId) {
+      setError('请先在项目管理中创建项目。');
+      return;
+    }
     setMode('create');
     setDraft({ name: '', description: '', parentId, sortOrder: 0, isActive: true });
     if (parentId) {
@@ -3969,6 +5533,10 @@ function FeatureMenus({ projects, currentProjectId, setCurrentProjectId, feature
 
   const saveCreate = async () => {
     const name = draft.name.trim();
+    if (!currentProjectId) {
+      setError('请先在项目管理中创建项目。');
+      return;
+    }
     if (!name) {
       setError('功能名称不能为空');
       return;
@@ -4082,11 +5650,11 @@ function FeatureMenus({ projects, currentProjectId, setCurrentProjectId, feature
           <p>按项目维护产品功能树，并为测试用例提供可追溯的功能归属。</p>
         </div>
         <div className="action-row">
-          <button type="button" className="ghost-button" onClick={() => refreshFeatures()}>
+          <button type="button" className="ghost-button" onClick={() => refreshFeatures()} disabled={!currentProjectId}>
             <RefreshCw size={16} />
             刷新
           </button>
-          <button type="button" className="primary-action" onClick={() => beginCreate('')}>
+          <button type="button" className="primary-action" onClick={() => beginCreate('')} disabled={!currentProjectId}>
             <Plus size={17} />
             新增根功能
           </button>
@@ -4097,6 +5665,7 @@ function FeatureMenus({ projects, currentProjectId, setCurrentProjectId, feature
         <label className="field compact-field">
           <span>当前项目</span>
           <select value={currentProjectId} onChange={(event) => setCurrentProjectId(event.target.value)}>
+            <option value="">请选择项目</option>
             {projects.map((project) => <option value={project.id} key={project.id}>{project.name}</option>)}
           </select>
         </label>
@@ -4119,8 +5688,8 @@ function FeatureMenus({ projects, currentProjectId, setCurrentProjectId, feature
           {visibleTree.length ? visibleTree.map((feature) => renderFeatureNode(feature)) : (
             <div className="empty-state feature-empty">
               <FolderTree size={34} />
-              <span>{features.length ? '没有匹配的功能。' : '暂无功能菜单配置。先新增根功能，再继续添加不限层级的子功能。'}</span>
-              {!features.length && (
+              <span>{!currentProjectId ? '暂无项目。请先在项目管理中创建项目。' : features.length ? '没有匹配的功能。' : '暂无功能菜单配置。先新增根功能，再继续添加不限层级的子功能。'}</span>
+              {!features.length && currentProjectId && (
                 <button type="button" className="primary-action" onClick={() => beginCreate('')}>
                   <Plus size={17} />
                   新增根功能
@@ -4147,8 +5716,8 @@ function FeatureMenus({ projects, currentProjectId, setCurrentProjectId, feature
           {mode === 'empty' && !selectedFeature ? (
             <div className="empty-suite-state">
               <FolderTree size={34} />
-              <span>选择左侧功能查看详情，或新增根功能开始配置。</span>
-              <button type="button" className="primary-action" onClick={() => beginCreate('')}>
+              <span>{currentProjectId ? '选择左侧功能查看详情，或新增根功能开始配置。' : '暂无项目。请先在项目管理中创建项目。'}</span>
+              <button type="button" className="primary-action" onClick={() => beginCreate('')} disabled={!currentProjectId}>
                 <Plus size={17} />
                 新增根功能
               </button>
@@ -4219,7 +5788,29 @@ function FeatureMenus({ projects, currentProjectId, setCurrentProjectId, feature
   );
 }
 
-function CaseManagement({ testCases, features, selectedCaseIds, toggleCaseSelection, setAllVisibleCasesSelected, runSelectedCases, createSuiteFromSelection, newSuiteName, setNewSuiteName, setActiveModule, bindCaseFeature }) {
+function CaseManagement({
+  testCases,
+  features,
+  selectedCaseIds,
+  toggleCaseSelection,
+  setAllVisibleCasesSelected,
+  runSelectedCases,
+  createSuiteFromSelection,
+  newSuiteName,
+  setNewSuiteName,
+  setActiveModule,
+  bindCaseFeature,
+  deleteCase,
+  deleteSelectedCases,
+  scriptEditor,
+  openScriptEditor,
+  closeScriptEditor,
+  updateScriptEditorContent,
+  saveScriptEditorDraft,
+  canManageAssets = true,
+  canExecute = true,
+  canEditScripts = true,
+}) {
   const [priorityFilter, setPriorityFilter] = useState('all');
   const [statusFilter, setStatusFilter] = useState('all');
   const [featureFilter, setFeatureFilter] = useState('all');
@@ -4246,7 +5837,7 @@ function CaseManagement({ testCases, features, selectedCaseIds, toggleCaseSelect
             <FileCheck2 size={17} />
             设计用例
           </button>
-          <button type="button" className="primary-action" disabled={!selectedCount} onClick={() => runSelectedCases()}>
+          <button type="button" className="primary-action" disabled={!selectedCount || !canExecute} onClick={() => runSelectedCases()}>
             <Play size={17} />
             执行已选 {selectedCount}
           </button>
@@ -4278,10 +5869,14 @@ function CaseManagement({ testCases, features, selectedCaseIds, toggleCaseSelect
           全选筛选结果
         </button>
         <button type="button" className="ghost-button" onClick={() => setAllVisibleCasesSelected(filteredCases, false)}>取消筛选选择</button>
+        <button type="button" className="ghost-button danger-button" disabled={!selectedCount || !canManageAssets} onClick={deleteSelectedCases}>
+          <Trash2 size={16} />
+          删除已选 {selectedCount}
+        </button>
       </div>
       <div className="suite-create-row">
         <input value={newSuiteName} onChange={(event) => setNewSuiteName(event.target.value)} placeholder="套件名称" />
-        <button type="button" className="ghost-button" disabled={!selectedCount} onClick={createSuiteFromSelection}>
+        <button type="button" className="ghost-button" disabled={!selectedCount || !canManageAssets} onClick={createSuiteFromSelection}>
           <Save size={16} />
           保存为套件
         </button>
@@ -4295,6 +5890,7 @@ function CaseManagement({ testCases, features, selectedCaseIds, toggleCaseSelect
           <span>自动化</span>
           <span>最近结果</span>
           <span>绑定脚本</span>
+          <span>操作</span>
         </div>
         {filteredCases.length ? filteredCases.map((item) => (
           <div className="case-row" key={item.id}>
@@ -4307,7 +5903,7 @@ function CaseManagement({ testCases, features, selectedCaseIds, toggleCaseSelect
               <small>{item.requirement || item.steps || '暂无需求描述'}</small>
             </div>
             <span>{item.priority || '-'}</span>
-            <select className="case-feature-select" value={item.featureId || ''} onChange={(event) => bindCaseFeature(item.id, event.target.value)} aria-label={`${item.externalId} 绑定功能`}>
+            <select className="case-feature-select" value={item.featureId || ''} disabled={!canManageAssets} onChange={(event) => bindCaseFeature(item.id, event.target.value)} aria-label={`${item.externalId} 绑定功能`}>
               <option value="">未绑定</option>
               {activeFeatureOptions(features, item.featureId).map((feature) => (
                 <option value={feature.id} key={feature.id}>{feature.path}{feature.isActive ? '' : '（停用）'}</option>
@@ -4315,11 +5911,88 @@ function CaseManagement({ testCases, features, selectedCaseIds, toggleCaseSelect
             </select>
             <span>{statusLabel(item.automationStatus || 'manual')}</span>
             <span>{item.latestStatus ? statusLabel(item.latestStatus) : '暂无'}</span>
-            <span>{item.specPath || '未绑定'}</span>
+            <span className="case-script-cell">
+              {item.scriptVersionId ? (
+                <button type="button" className="script-link-button" onClick={() => openScriptEditor(item)} title="打开脚本编辑弹窗">
+                  <FileCode2 size={15} />
+                  <span>{item.specPath || '查看脚本'}</span>
+                  <small>v{item.scriptVersion || '-'} · {statusLabel(item.scriptStatus || 'active')}</small>
+                </button>
+              ) : (
+                <span className="muted">未绑定</span>
+              )}
+            </span>
+            <button type="button" className="ghost-button danger-button case-delete-button" disabled={!canManageAssets} onClick={() => deleteCase(item)} aria-label={`删除用例 ${item.externalId || item.title || item.id}`} title="删除用例">
+              <Trash2 size={16} />
+            </button>
           </div>
         )) : <p className="muted">暂无结构化用例。先在用例设计中保存 Markdown 用例，系统会自动解析入库。</p>}
       </div>
+      {scriptEditor?.open && (
+        <ScriptEditorModal
+          editor={scriptEditor}
+          canEdit={canEditScripts}
+          onClose={closeScriptEditor}
+          onChange={updateScriptEditorContent}
+          onSaveDraft={saveScriptEditorDraft}
+        />
+      )}
     </section>
+  );
+}
+
+function ScriptEditorModal({ editor, canEdit, onClose, onChange, onSaveDraft }) {
+  const detail = editor.detail || {};
+  const sourceCase = editor.sourceCase || {};
+  const boundCases = detail.boundCases || [];
+  const title = sourceCase.externalId ? `${sourceCase.externalId} · ${sourceCase.title || '绑定脚本'}` : '绑定脚本';
+  return (
+    <div className="artifact-preview-modal script-editor-modal" role="dialog" aria-modal="true" aria-label="脚本编辑弹窗">
+      <div className="artifact-preview-modal-card script-editor-card">
+        <header className="artifact-renderer-header modal script-editor-header">
+          <div>
+            <h3>{title}</h3>
+            <p>{editor.loading ? '正在加载脚本内容...' : `${detail.specPath || sourceCase.specPath || '未记录路径'} · v${detail.version || sourceCase.scriptVersion || '-'} · ${statusLabel(detail.status || sourceCase.scriptStatus || 'active')}`}</p>
+          </div>
+          <button type="button" className="artifact-modal-close" title="关闭脚本编辑器" onClick={onClose}>
+            <X size={18} />
+          </button>
+        </header>
+        <div className="script-editor-meta">
+          <div><span>保存规则</span><strong>另存草稿，不替换 active</strong></div>
+          <div><span>所属工单</span><strong>{detail.workItem?.title || detail.workItemId || '-'}</strong></div>
+          <div><span>验证 Run</span><strong>{detail.verifiedRunId || '未验证'}</strong></div>
+          <div><span>绑定用例</span><strong>{boundCases.length || (sourceCase.id ? 1 : 0)} 条</strong></div>
+        </div>
+        {editor.error ? <div className="script-editor-error" role="alert">{editor.error}</div> : null}
+        <div className="script-editor-body">
+          {editor.loading ? (
+            <div className="artifact-render-empty inline">
+              <strong>正在读取脚本版本</strong>
+              <span>请稍候。</span>
+            </div>
+          ) : (
+            <textarea
+              className="editor code script-editor-textarea"
+              value={editor.content}
+              disabled={!canEdit || editor.saving}
+              onChange={(event) => onChange(event.target.value)}
+              placeholder="在这里编辑 Playwright TypeScript 脚本。"
+            />
+          )}
+        </div>
+        <footer className="script-editor-footer">
+          <span>{canEdit ? '保存后会创建新的 draft 版本，运行验证通过后再发布。' : '当前账号为只读权限，不能保存草稿。'}</span>
+          <div className="action-row">
+            <button type="button" className="ghost-button" onClick={onClose}>关闭</button>
+            <button type="button" className="primary-action" disabled={!canEdit || editor.loading || editor.saving} onClick={onSaveDraft}>
+              <Save size={16} />
+              {editor.saving ? '保存中...' : '另存草稿'}
+            </button>
+          </div>
+        </footer>
+      </div>
+    </div>
   );
 }
 
@@ -4361,6 +6034,7 @@ function AutomationFlow({
   clearFlow,
   logRef,
   resetKey,
+  canRunFlow = true,
 }) {
   const [technicalLogsOpen, setTechnicalLogsOpen] = useState(false);
   const [selectedArtifactId, setSelectedArtifactId] = useState('');
@@ -4381,7 +6055,7 @@ function AutomationFlow({
   const hasRunningArtifact = flowArtifacts.some((artifact) => artifact.status === 'streaming');
   const stageBrief = buildStageBrief(activeStage, status, flowArtifacts, logs, flow);
   const conversationMessages = buildFlowConversationMessages({ requirement, flow, logs, artifacts: flowArtifacts, activeStage, status });
-  const stageSummaries = buildStageSummaries(AUTOMATION_FLOW_STAGES, flowArtifacts, logs, activeStage, status);
+  const stageSummaries = buildStageSummaries(AUTOMATION_FLOW_STAGES, flowArtifacts, logs, activeStage, status, flow);
   const clarificationItems = buildClarificationItems({ flow, logs, activeStage, status });
   const issueLogs = logs.filter((log) => ['error', 'blocked', 'warning'].includes(log.level));
   const severeLogs = logs.filter((log) => ['error', 'blocked'].includes(log.level));
@@ -4404,8 +6078,8 @@ function AutomationFlow({
   const hasProject = Boolean(selectedProjectId);
   const hasFeature = Boolean(selectedFeatureId);
   const isBusy = ['running', 'queued', 'healing'].includes(status);
-  const canStart = !isBusy && hasProject && hasFeature;
-  const startHint = !hasProject ? '请选择项目名称' : !hasFeature ? '请选择功能' : '';
+  const canStart = canRunFlow && !isBusy && hasProject && hasFeature;
+  const startHint = !canRunFlow ? '当前账号无权启动全流程' : !hasProject ? '请选择项目名称' : !hasFeature ? '请选择功能' : '';
   const scrollToClarification = () => {
     if (clarificationOpen) {
       setClarificationOpen(false);
@@ -5373,6 +7047,7 @@ function stageStateLabel(state) {
     done: '已完成',
     running: '进行中',
     failed: '需处理',
+    skipped: '无需自愈',
     idle: '待开始',
   }[state] || state;
 }
@@ -5528,18 +7203,28 @@ function buildCustomerUpdates(logs, artifacts, activeStage, status) {
   return dedupeByTitle(updates).slice(0, 7);
 }
 
-function buildStageSummaries(stages, artifacts, logs, activeStage, status) {
+function buildStageSummaries(stages, artifacts, logs, activeStage, status, flow) {
+  const currentStage = activeStage || flow?.stage || '';
+  const currentIndex = stages.indexOf(currentStage);
+  const finalIndex = stages.indexOf('保存已验证产物');
+  const healingStage = '自愈诊断';
   return stages.map((stage) => {
+    const stageIndex = stages.indexOf(stage);
     const stageArtifacts = artifacts.filter((artifact) => artifact.stage === stage);
     const stageLogs = logs.filter((log) => log.stage === stage);
     const failed = stageLogs.some((log) => ['error', 'blocked'].includes(log.level)) || stageArtifacts.some((artifact) => artifact.status === 'failed');
     const streaming = stageArtifacts.some((artifact) => artifact.status === 'streaming') || (stage === activeStage && ['running', 'queued', 'healing'].includes(status));
-    const completed = stageArtifacts.some((artifact) => ['ready', 'verified', 'saved', 'fallback'].includes(artifact.status)) || stageLogs.some((log) => log.level === 'success');
+    const hasStageEvidence = stageArtifacts.length > 0 || stageLogs.length > 0;
+    const completedByEvidence = stageArtifacts.some((artifact) => ['ready', 'verified', 'saved', 'fallback'].includes(artifact.status)) || stageLogs.some((log) => log.level === 'success');
+    const progressedPastStage = currentIndex > stageIndex || (status === 'completed' && finalIndex > stageIndex);
+    const skipped = stage === healingStage && status === 'completed' && !hasStageEvidence;
+    const completed = !skipped && (completedByEvidence || (progressedPastStage && (hasStageEvidence || stage !== healingStage)));
+    const state = failed ? 'failed' : streaming ? 'running' : skipped ? 'skipped' : completed ? 'done' : 'idle';
     return {
       stage,
-      state: failed ? 'failed' : streaming ? 'running' : completed ? 'done' : 'idle',
-      icon: failed ? AlertTriangle : streaming ? Clock : completed ? CheckCircle2 : ListChecks,
-      summary: stageSummaryText(stage, stageArtifacts, stageLogs, { failed, streaming, completed }),
+      state,
+      icon: failed ? AlertTriangle : streaming ? Clock : skipped ? CircleDot : completed ? CheckCircle2 : ListChecks,
+      summary: stageSummaryText(stage, stageArtifacts, stageLogs, { failed, streaming, skipped, completed }),
     };
   });
 }
@@ -5600,6 +7285,7 @@ function stageSummaryText(stage, artifacts, logs, state) {
     return issue?.message || '发现阻塞或失败，已保留技术明细。';
   }
   if (state.streaming) return stageFriendlyDescription(stage);
+  if (state.skipped) return '运行验证已通过，无需进入脚本自愈。';
   if (!state.completed) return '等待进入该阶段。';
   if (stage === '用例设计') {
     const content = artifacts.find((artifact) => artifact.artifactType === 'test-cases')?.content || '';
@@ -5757,10 +7443,33 @@ function artifactStatusLabel(status) {
   }[status] || status;
 }
 
-function Requirements({ form, setForm, createWorkItem, item, analyzing, setActiveModule }) {
+function Requirements({
+  projects,
+  selectedProjectId,
+  selectedFeatureId,
+  featureTree,
+  featureOptions,
+  onProjectChange,
+  onFeatureChange,
+  form,
+  setForm,
+  createWorkItem,
+  item,
+  analyzing,
+  setActiveModule,
+  canCreate = true,
+}) {
   const analysis = item?.requirementAnalysis;
   const project = item?.projectContext;
   const sourceLabel = analysis?.source === 'ai' ? 'AI 自动提取' : analysis?.source ? '规则兜底提取' : '等待分析';
+  const flatFeatureTree = useMemo(() => flattenFeatureTree(featureTree), [featureTree]);
+  const selectableFeatures = activeFeatureOptions(flatFeatureTree.length ? flatFeatureTree : featureOptions, selectedFeatureId);
+  const selectedProject = projects.find((projectItem) => projectItem.id === selectedProjectId) || null;
+  const selectedFeature = selectableFeatures.find((feature) => feature.id === selectedFeatureId) || null;
+  const hasProject = Boolean(selectedProjectId);
+  const hasFeature = Boolean(selectedFeatureId);
+  const canAnalyze = canCreate && !analyzing && hasProject && hasFeature && form.requirement.trim();
+  const analyzeHint = !canCreate ? '当前账号无权创建需求工单' : !hasProject ? '请选择项目名称' : !hasFeature ? '请选择功能' : '';
   return (
     <section className="module-section" aria-label="需求工单">
       <div className="section-header">
@@ -5771,6 +7480,38 @@ function Requirements({ form, setForm, createWorkItem, item, analyzing, setActiv
       </div>
 
       <div className="requirement-analysis-card">
+        <div className="automation-context-fields requirement-context-fields" aria-label="需求工单绑定上下文">
+          <label>
+            <span><Database size={15} /> 项目名称 <b>必填</b></span>
+            <select
+              data-testid="requirement-project"
+              value={selectedProjectId}
+              onChange={(event) => onProjectChange(event.target.value)}
+              disabled={analyzing}
+            >
+              <option value="">请选择项目</option>
+              {projects.map((projectItem) => (
+                <option value={projectItem.id} key={projectItem.id}>{projectItem.name}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span><FolderTree size={15} /> 功能 <b>必填</b></span>
+            <select
+              data-testid="requirement-feature"
+              value={selectedFeatureId}
+              onChange={(event) => onFeatureChange(event.target.value)}
+              disabled={analyzing || !selectedProjectId || !selectableFeatures.length}
+            >
+              <option value="">{selectedProjectId && !selectableFeatures.length ? '当前项目暂无可选功能' : '请选择功能'}</option>
+              {selectableFeatures.map((feature) => (
+                <option value={feature.id} key={feature.id}>
+                  {`${'　'.repeat(feature.depth || 0)}${feature.path || feature.name}${feature.isActive ? '' : '（停用）'}`}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
         <label className="requirement-input-field">
           <span>需求输入</span>
           <textarea
@@ -5781,7 +7522,7 @@ function Requirements({ form, setForm, createWorkItem, item, analyzing, setActiv
           />
         </label>
         <div className="action-row requirement-actions">
-          <button type="button" className="primary-action" disabled={analyzing || !form.requirement.trim()} onClick={createWorkItem}>
+          <button type="button" className="primary-action" disabled={!canAnalyze} onClick={createWorkItem} title={analyzeHint}>
             <Sparkles size={17} />
             {analyzing ? '分析中...' : '需求分析'}
           </button>
@@ -5801,6 +7542,8 @@ function Requirements({ form, setForm, createWorkItem, item, analyzing, setActiv
               <h3>需求抽取/澄清检查</h3>
               <span className="source-chip">{sourceLabel}</span>
             </div>
+            <div className="delivery-row"><span>绑定项目</span><strong>{item?.project?.name || selectedProject?.name || item?.projectId || '-'}</strong></div>
+            <div className="delivery-row"><span>绑定功能</span><strong>{item?.featurePath || item?.featureName || selectedFeature?.path || selectedFeature?.name || '-'}</strong></div>
             <div className="delivery-row"><span>功能目标</span><strong>{analysis.goal}</strong></div>
             <div className="delivery-row"><span>用户路径</span><strong>{analysis.userPath}</strong></div>
             <div className="delivery-row"><span>验收标准</span><strong>{analysis.acceptance}</strong></div>
@@ -5826,7 +7569,7 @@ function Requirements({ form, setForm, createWorkItem, item, analyzing, setActiv
   );
 }
 
-function Exploration({ item, exploration, explorationRun, explorationLogs, browserStatus, browserStatusDetail, liveConnected, browserCanvasRef, setExploration, updateElement, addElement, setAllElementsConfirmed, saveExploration, runExploration, exploring, sendBrowserCommand, handleBrowserClick, handleBrowserMove, handleBrowserWheel, handleBrowserKeyDown }) {
+function Exploration({ item, exploration, explorationRun, explorationLogs, browserStatus, browserStatusDetail, liveConnected, browserCanvasRef, setExploration, updateElement, addElement, setAllElementsConfirmed, saveExploration, runExploration, exploring, sendBrowserCommand, handleBrowserClick, handleBrowserMove, handleBrowserWheel, handleBrowserKeyDown, canEdit = true }) {
   const hasCases = Boolean(item?.casesMarkdown);
   const stageLabel = browserStatusDetail || explorationRun?.stage?.label || (exploring ? '准备探索环境' : '等待探索');
   const progress = explorationRun?.progress || 0;
@@ -5882,11 +7625,11 @@ function Exploration({ item, exploration, explorationRun, explorationLogs, brows
           <p>根据已保存测试用例执行页面探索，确认真实 DOM、可访问名称和稳定 selector。</p>
         </div>
         <div className="action-row">
-          <button type="button" className="ghost-button" disabled={!item || !hasCases || exploring} onClick={runExploration}>
+          <button type="button" className="ghost-button" disabled={!item || !hasCases || exploring || !canEdit} onClick={runExploration}>
             <FlaskConical size={17} />
             {exploring ? '探索中' : '执行探索'}
           </button>
-          <button type="button" className="primary-action" disabled={!item || !hasCases} onClick={saveExploration}>
+          <button type="button" className="primary-action" disabled={!item || !hasCases || !canEdit} onClick={saveExploration}>
             <Save size={17} />
             保存探索
           </button>
@@ -6058,9 +7801,10 @@ function Exploration({ item, exploration, explorationRun, explorationLogs, brows
   );
 }
 
-function Cases({ item, casesMarkdown, setCasesMarkdown, generateCases }) {
+function Cases({ item, casesMarkdown, setCasesMarkdown, generateCases, assetMode, setAssetMode, canEdit = true }) {
   const analysis = item?.requirementAnalysis;
   const project = item?.projectContext;
+  const boundCaseCount = item?.caseIds?.length || item?.testCases?.length || 0;
   return (
     <section className="module-section" aria-label="用例设计">
       <div className="section-header">
@@ -6068,7 +7812,7 @@ function Cases({ item, casesMarkdown, setCasesMarkdown, generateCases }) {
           <h2>可追溯测试用例</h2>
           <p>实现脚本前先保存测试用例；字段必须覆盖 ID、标题、优先级、覆盖需求、前置条件/测试数据、步骤、期望结果和自动化说明。</p>
         </div>
-        <button type="button" className="primary-action" disabled={!item} onClick={generateCases}>
+        <button type="button" className="primary-action" disabled={!item || !canEdit} onClick={generateCases}>
           <Brain size={17} />
           生成/保存用例
         </button>
@@ -6079,17 +7823,28 @@ function Cases({ item, casesMarkdown, setCasesMarkdown, generateCases }) {
           <p className="muted">需求：{analysis?.goal}</p>
           <p className="muted">验收：{analysis?.acceptance}</p>
           <p className="muted">项目约定：{project?.testDir} / {project?.specPattern}；{project?.locatorStyle}</p>
+          <div className="asset-mode-row">
+            <label className="field compact-field">
+              <span>资产模式</span>
+              <select value={assetMode} disabled={!canEdit} onChange={(event) => setAssetMode(event.target.value)}>
+                <option value="create">新建用例和脚本</option>
+                <option value="refresh" disabled={!boundCaseCount}>刷新替换已有用例</option>
+                <option value="append">追加/整改覆盖点</option>
+              </select>
+            </label>
+            <span className="source-chip">{assetModeLabel(assetMode)} · 已绑定 {boundCaseCount} 条用例</span>
+          </div>
         </div>
       )}
-      <textarea className="editor markdown" value={casesMarkdown} onChange={(event) => setCasesMarkdown(event.target.value)} placeholder="在这里粘贴或编辑测试用例 markdown 表格。" />
+      <textarea className="editor markdown" value={casesMarkdown} disabled={!canEdit} onChange={(event) => setCasesMarkdown(event.target.value)} placeholder="在这里粘贴或编辑测试用例 markdown 表格。" />
     </section>
   );
 }
 
-function Scripts({ item, latestRun, scriptContent, setScriptContent, generateScript, saveArtifacts }) {
+function Scripts({ item, latestRun, scriptContent, setScriptContent, generateScript, saveArtifacts, assetMode, canEdit = true, canSaveArtifacts: canPublishArtifacts = true }) {
   const runMatchesItem = latestRun?.workItemId === item?.id;
   const hasVerifiedRun = Boolean(item?.latestRunId && (!runMatchesItem || latestRun.status !== 'running'));
-  const canSaveArtifacts = Boolean(item?.scriptContent && hasVerifiedRun);
+  const canSaveArtifacts = canPublishArtifacts && Boolean(item?.scriptContent && hasVerifiedRun && latestRun?.status === 'passed');
   return (
     <section className="module-section" aria-label="脚本工作台">
       <div className="section-header">
@@ -6098,7 +7853,7 @@ function Scripts({ item, latestRun, scriptContent, setScriptContent, generateScr
           <p>基于已保存测试用例和已确认元素生成草稿 spec；每个关键 locator 必须来自确认过的页面信息。</p>
         </div>
         <div className="action-row">
-          <button type="button" className="ghost-button" disabled={!item} onClick={generateScript}>
+          <button type="button" className="ghost-button" disabled={!item || !canEdit} onClick={generateScript}>
             <Code2 size={17} />
             生成/保存草稿脚本
           </button>
@@ -6108,12 +7863,17 @@ function Scripts({ item, latestRun, scriptContent, setScriptContent, generateScr
           </button>
         </div>
       </div>
-      <textarea className="editor code" value={scriptContent} onChange={(event) => setScriptContent(event.target.value)} placeholder="在这里粘贴或编辑 Playwright TypeScript 草稿 spec。" />
+      <div className="data-panel compact-script-panel">
+        <div className="delivery-row"><span>资产模式</span><strong>{assetModeLabel(assetMode)}</strong></div>
+        <div className="delivery-row"><span>当前验证</span><strong>{latestRun ? statusLabel(latestRun.status) : '未运行'}</strong></div>
+        <div className="delivery-row"><span>发布规则</span><strong>验证通过后保存才替换 active 绑定</strong></div>
+      </div>
+      <textarea className="editor code" value={scriptContent} disabled={!canEdit} onChange={(event) => setScriptContent(event.target.value)} placeholder="在这里粘贴或编辑 Playwright TypeScript 草稿 spec。" />
     </section>
   );
 }
 
-function Execution({ latestRun, logs, screenshot, runCurrentItem, currentItem, browserStatus, browserStatusDetail, liveConnected, browserCanvasRef, sendBrowserCommand, handleBrowserClick, handleBrowserMove, handleBrowserWheel, handleBrowserKeyDown }) {
+function Execution({ latestRun, logs, screenshot, runCurrentItem, currentItem, browserStatus, browserStatusDetail, liveConnected, browserCanvasRef, sendBrowserCommand, handleBrowserClick, handleBrowserMove, handleBrowserWheel, handleBrowserKeyDown, canExecute = true }) {
   const progress = latestRun?.progress || 0;
   const stageLabel = browserStatusDetail || latestRun?.stage?.label || '等待执行';
   const runStatus = latestRun ? statusLabel(latestRun.status) : '未启动';
@@ -6149,7 +7909,7 @@ function Execution({ latestRun, logs, screenshot, runCurrentItem, currentItem, b
           <h2>执行测试</h2>
           <p>运行草稿 spec，生成 Playwright HTML report；验证后才能保存最终交付物。</p>
         </div>
-        <button type="button" className="primary-action" disabled={!currentItem?.scriptContent || latestRun?.status === 'running'} onClick={runCurrentItem}>
+        <button type="button" className="primary-action" disabled={!currentItem?.scriptContent || latestRun?.status === 'running' || !canExecute} onClick={runCurrentItem}>
           <Play size={17} />
           执行当前任务
         </button>
@@ -6235,7 +7995,7 @@ function Execution({ latestRun, logs, screenshot, runCurrentItem, currentItem, b
   );
 }
 
-function Healing({ item, form, setForm, recordHealing }) {
+function Healing({ item, form, setForm, recordHealing, canEdit = true }) {
   return (
     <section className="module-section" aria-label="自愈诊断">
       <div className="section-header">
@@ -6243,7 +8003,7 @@ function Healing({ item, form, setForm, recordHealing }) {
           <h2>失败诊断与自愈记录</h2>
           <p>最多 3 轮，只记录测试侧修复：selector、等待、断言、测试数据。</p>
         </div>
-        <button type="button" className="primary-action" disabled={!item} onClick={recordHealing}>
+        <button type="button" className="primary-action" disabled={!item || !canEdit} onClick={recordHealing}>
           <RefreshCw size={17} />
           记录自愈
         </button>
@@ -6543,13 +8303,39 @@ function ExecutionMonitor({
   );
 }
 
-function Delivery({ item, projects, deliveryReport, deliveryFilters, setDeliveryFilters, loadDeliveryReport, fetchJson }) {
-  const [expandedCaseId, setExpandedCaseId] = useState('');
+const REQUIRED_DELIVERY_TYPES = ['test-cases', 'spec', 'manual-report', 'html-report'];
+
+function Delivery({ item, projects, currentProjectId, deliveryReport, deliveryFilters, setDeliveryFilters, loadDeliveryReport, fetchJson }) {
+  const [selectedCaseId, setSelectedCaseId] = useState('');
   const [expandedDeliverables, setExpandedDeliverables] = useState({});
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [advancedFiltersOpen, setAdvancedFiltersOpen] = useState(false);
+  const [density, setDensity] = useState('cards');
+  const [contentPreviewOpen, setContentPreviewOpen] = useState({});
+  const defaultScopeAppliedRef = useRef(false);
   const rows = deliveryReport.items || [];
+  const summary = deliveryReport.summary || { total: deliveryReport.total || 0, ready: 0, missing: 0, failedRisk: 0, missingByType: {} };
   const totalPages = Math.max(1, Math.ceil((deliveryReport.total || 0) / (deliveryReport.pageSize || 50)));
-  const hasScopedFilter = Boolean(deliveryFilters.work_item_id || deliveryFilters.project_id || deliveryFilters.case_id || deliveryFilters.q || deliveryFilters.priority !== 'all' || deliveryFilters.automation_status !== 'all' || deliveryFilters.latest_status !== 'all' || deliveryFilters.deliverable_type !== 'all' || deliveryFilters.updated_from || deliveryFilters.updated_to);
+  const hasScopedFilter = Boolean(deliveryFilters.work_item_id || deliveryFilters.project_id || deliveryFilters.case_id || deliveryFilters.q || deliveryFilters.readiness !== 'all' || deliveryFilters.priority !== 'all' || deliveryFilters.automation_status !== 'all' || deliveryFilters.latest_status !== 'all' || deliveryFilters.deliverable_type !== 'all' || deliveryFilters.updated_from || deliveryFilters.updated_to);
+  const currentScopeLabel = deliveryFilters.work_item_id
+    ? `当前工单：${item?.title || deliveryFilters.work_item_id}`
+    : deliveryFilters.project_id
+      ? `当前项目：${projects.find((project) => project.id === deliveryFilters.project_id)?.name || deliveryFilters.project_id}`
+      : '全局视图';
+
+  useEffect(() => {
+    if (defaultScopeAppliedRef.current) return;
+    const hasScope = deliveryFilters.work_item_id || deliveryFilters.project_id || deliveryFilters.case_id;
+    if (hasScope) return;
+    const nextFilters = { ...deliveryFilters };
+    if (item?.id) nextFilters.work_item_id = item.id;
+    else if (currentProjectId) nextFilters.project_id = currentProjectId;
+    if (nextFilters.work_item_id || nextFilters.project_id) {
+      defaultScopeAppliedRef.current = true;
+      setDeliveryFilters(nextFilters);
+      loadDeliveryReport(nextFilters, 1);
+    }
+  }, [item?.id, currentProjectId]);
 
   const updateFilter = (key, value) => {
     setDeliveryFilters((current) => ({ ...current, [key]: value }));
@@ -6557,14 +8343,14 @@ function Delivery({ item, projects, deliveryReport, deliveryFilters, setDelivery
 
   const applyFilters = async (page = 1) => {
     await loadDeliveryReport(deliveryFilters, page);
-    setExpandedCaseId('');
+    setSelectedCaseId('');
   };
 
   const resetFilters = async () => {
     const nextFilters = emptyDeliveryFilters();
     setDeliveryFilters(nextFilters);
     await loadDeliveryReport(nextFilters, 1);
-    setExpandedCaseId('');
+    setSelectedCaseId('');
   };
 
   const scopeToCurrentItem = async () => {
@@ -6572,17 +8358,21 @@ function Delivery({ item, projects, deliveryReport, deliveryFilters, setDelivery
     const nextFilters = { ...emptyDeliveryFilters(), work_item_id: item.id };
     setDeliveryFilters(nextFilters);
     await loadDeliveryReport(nextFilters, 1);
-    setExpandedCaseId('');
+    setSelectedCaseId('');
   };
 
-  const loadPreview = async (row) => {
+  const scopeToCurrentProject = async () => {
+    if (!currentProjectId) return;
+    const nextFilters = { ...emptyDeliveryFilters(), project_id: currentProjectId };
+    setDeliveryFilters(nextFilters);
+    await loadDeliveryReport(nextFilters, 1);
+    setSelectedCaseId('');
+  };
+
+  const loadDetail = async (row) => {
     const caseId = row.case?.id;
     if (!caseId) return;
-    if (expandedCaseId === caseId) {
-      setExpandedCaseId('');
-      return;
-    }
-    setExpandedCaseId(caseId);
+    setSelectedCaseId(caseId);
     if (expandedDeliverables[caseId]) return;
     setPreviewLoading(true);
     try {
@@ -6610,33 +8400,53 @@ function Delivery({ item, projects, deliveryReport, deliveryFilters, setDelivery
     }
   };
 
-  const renderDeliverableState = (row, type) => {
+  const deliverableHref = (deliverable) => {
+    if (!deliverable) return '';
+    if (deliverable.type === 'html-report') return playwrightReportUrl();
+    if (deliverable.type === 'manual-report') return deliverableReportUrl(deliverable);
+    return '';
+  };
+
+  const readinessLabel = (value) => ({
+    ready: '可交付',
+    missing: '缺失',
+    risk: '失败风险',
+  }[value] || '待审阅');
+
+  const renderDeliverableChip = (row, type) => {
     const deliverable = row.deliverableSummary?.[type];
-    if (!deliverable) return <span className="missing-state">待生成</span>;
-    const fileName = deliverable.filePath ? deliverable.filePath.split('/').pop() : '';
-    if (type === 'html-report' || type === 'manual-report') {
-      const href = type === 'html-report' ? playwrightReportUrl() : deliverableReportUrl(deliverable);
-      return (
-        <a className="delivery-table-link" href={href} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>
-          {type === 'html-report' ? '打开' : '渲染'}
-          <ExternalLink size={12} />
-        </a>
-      );
-    }
+    const isRequired = REQUIRED_DELIVERY_TYPES.includes(type);
+    if (!deliverable) return <span key={type} className={isRequired ? 'delivery-chip missing' : 'delivery-chip optional'}>{deliveryTypeLabel(type)}缺失</span>;
     return (
-      <span className="ready-state deliverable-state-detail">
-        v{deliverable.version}
-        {fileName ? <small>{fileName}</small> : null}
+      <span key={type} className="delivery-chip ready">
+        <CheckCircle2 size={13} />
+        {deliveryTypeLabel(type)} v{deliverable.version || 1}
       </span>
     );
   };
+
+  const renderPrimaryAction = (row) => {
+    const manualReport = row.deliverableSummary?.['manual-report'];
+    const htmlReport = row.deliverableSummary?.['html-report'];
+    const target = manualReport || htmlReport;
+    if (!target) return <span className="delivery-action-empty">报告缺失</span>;
+    return (
+      <a className="delivery-primary-link" href={deliverableHref(target)} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>
+        打开报告
+        <ExternalLink size={14} />
+      </a>
+    );
+  };
+
+  const selectedRow = rows.find((row) => row.case?.id === selectedCaseId);
+  const selectedDeliverables = selectedRow ? (expandedDeliverables[selectedCaseId] || selectedRow.deliverables || []) : [];
 
   return (
     <section className="module-section delivery-report-page" aria-label="交付报告">
       <div className="section-header">
         <div>
-          <h2>全项目用例级交付报告</h2>
-          <p>默认展示所有项目下的所有测试用例；没有交付物的用例也会作为待生成项出现。</p>
+          <h2>交付审阅工作台</h2>
+          <p>{currentScopeLabel} · 按四件套判断交付完整性，缺失项优先展示。</p>
         </div>
         <div className="action-row">
           {item && (
@@ -6645,6 +8455,10 @@ function Delivery({ item, projects, deliveryReport, deliveryFilters, setDelivery
               当前工单
             </button>
           )}
+          <button type="button" className="ghost-button" onClick={scopeToCurrentProject}>
+            <Database size={16} />
+            当前项目
+          </button>
           <button type="button" className="ghost-button" disabled={!hasScopedFilter} onClick={resetFilters}>
             <RefreshCw size={16} />
             查看全部
@@ -6652,156 +8466,193 @@ function Delivery({ item, projects, deliveryReport, deliveryFilters, setDelivery
         </div>
       </div>
 
-      <div className="delivery-filter-grid" data-testid="delivery-report-filters">
-        <label className="field wide">
-          <span>关键词</span>
-          <input value={deliveryFilters.q} onChange={(event) => updateFilter('q', event.target.value)} placeholder="搜索用例、项目、工单、交付物" />
-        </label>
-        <label className="field">
-          <span>项目</span>
-          <select value={deliveryFilters.project_id} onChange={(event) => updateFilter('project_id', event.target.value)}>
-            <option value="">全部项目</option>
-            {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
-          </select>
-        </label>
-        <label className="field">
-          <span>优先级</span>
-          <select value={deliveryFilters.priority} onChange={(event) => updateFilter('priority', event.target.value)}>
-            <option value="all">全部</option>
-            <option value="P0">P0</option>
-            <option value="P1">P1</option>
-            <option value="P2">P2</option>
-          </select>
-        </label>
-        <label className="field">
-          <span>自动化</span>
-          <select value={deliveryFilters.automation_status} onChange={(event) => updateFilter('automation_status', event.target.value)}>
-            <option value="all">全部</option>
-            <option value="designed">已设计</option>
-            <option value="automated">已自动化</option>
-            <option value="manual">人工</option>
-          </select>
-        </label>
-        <label className="field">
-          <span>最近结果</span>
-          <select value={deliveryFilters.latest_status} onChange={(event) => updateFilter('latest_status', event.target.value)}>
-            <option value="all">全部</option>
-            <option value="passed">通过</option>
-            <option value="failed">失败</option>
-            <option value="skipped">跳过</option>
-          </select>
-        </label>
-        <label className="field">
-          <span>交付物</span>
-          <select value={deliveryFilters.deliverable_type} onChange={(event) => updateFilter('deliverable_type', event.target.value)}>
-            <option value="all">全部类型</option>
-            <option value="test-cases">用例文档</option>
-            <option value="spec">自动化脚本</option>
-            <option value="manual-report">人工报告</option>
-            <option value="html-report">HTML report</option>
-            <option value="execution-preview">执行证据</option>
-          </select>
-        </label>
-        <label className="field">
-          <span>更新起始</span>
-          <input type="date" value={deliveryFilters.updated_from} onChange={(event) => updateFilter('updated_from', event.target.value)} />
-        </label>
-        <label className="field">
-          <span>更新截止</span>
-          <input type="date" value={deliveryFilters.updated_to} onChange={(event) => updateFilter('updated_to', event.target.value)} />
-        </label>
-        <button type="button" className="primary-action" onClick={() => applyFilters(1)}>
-          <FileText size={16} />
-          查询
-        </button>
+      <div className="delivery-readiness-grid" aria-label="交付结论">
+        <div className="delivery-readiness-card total"><span>总用例</span><strong>{summary.total || 0}</strong></div>
+        <div className="delivery-readiness-card ready"><span>可交付</span><strong>{summary.ready || 0}</strong></div>
+        <div className="delivery-readiness-card missing"><span>缺失</span><strong>{summary.missing || 0}</strong></div>
+        <div className="delivery-readiness-card risk"><span>失败风险</span><strong>{summary.failedRisk || 0}</strong></div>
       </div>
 
-      {deliveryFilters.work_item_id && (
-        <div className="delivery-context-banner">
-          <span>当前按工单筛选：{item?.title || deliveryFilters.work_item_id}</span>
-          <button type="button" className="ghost-button" onClick={resetFilters}>清除筛选，查看全部项目</button>
-        </div>
-      )}
-
-      <div className="delivery-report-summary">
-        <strong>{deliveryReport.total || 0}</strong>
-        <span>条用例记录 · 第 {deliveryReport.page || 1}/{totalPages} 页</span>
+      <div className="delivery-missing-strip">
+        {REQUIRED_DELIVERY_TYPES.map((type) => (
+          <span key={type}>{deliveryTypeLabel(type)}缺失 <strong>{summary.missingByType?.[type] || 0}</strong></span>
+        ))}
       </div>
 
-      <div className="delivery-report-table" data-testid="delivery-report-table">
-        <div className="delivery-report-row delivery-report-head">
-          <span>项目</span>
-          <span>用例</span>
-          <span>优先级</span>
-          <span>自动化</span>
-          <span>最近结果</span>
-          <span>用例文档</span>
-          <span>脚本</span>
-          <span>人工报告</span>
-          <span>HTML report</span>
-          <span>证据</span>
-          <span>更新时间</span>
+      <div className="delivery-filter-panel" data-testid="delivery-report-filters">
+        <div className="delivery-basic-filters">
+          <label className="field wide">
+            <span>关键词</span>
+            <input value={deliveryFilters.q} onChange={(event) => updateFilter('q', event.target.value)} placeholder="搜索用例、项目、工单、交付物" />
+          </label>
+          <label className="field">
+            <span>完整性</span>
+            <select value={deliveryFilters.readiness} onChange={(event) => updateFilter('readiness', event.target.value)}>
+              <option value="all">全部状态</option>
+              <option value="missing">缺失</option>
+              <option value="risk">失败风险</option>
+              <option value="ready">可交付</option>
+            </select>
+          </label>
+          <button type="button" className="ghost-button" onClick={() => setAdvancedFiltersOpen((value) => !value)}>
+            <SlidersHorizontalFallback />
+            高级筛选
+          </button>
+          <button type="button" className="primary-action" onClick={() => applyFilters(1)}>
+            <Search size={16} />
+            查询
+          </button>
         </div>
+        {advancedFiltersOpen && (
+          <div className="delivery-advanced-filters">
+            <label className="field">
+              <span>项目</span>
+              <select value={deliveryFilters.project_id} onChange={(event) => updateFilter('project_id', event.target.value)}>
+                <option value="">全部项目</option>
+                {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
+              </select>
+            </label>
+            <label className="field">
+              <span>优先级</span>
+              <select value={deliveryFilters.priority} onChange={(event) => updateFilter('priority', event.target.value)}>
+                <option value="all">全部</option>
+                <option value="P0">P0</option>
+                <option value="P1">P1</option>
+                <option value="P2">P2</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>自动化</span>
+              <select value={deliveryFilters.automation_status} onChange={(event) => updateFilter('automation_status', event.target.value)}>
+                <option value="all">全部</option>
+                <option value="designed">已设计</option>
+                <option value="automated">已自动化</option>
+                <option value="manual">人工</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>最近结果</span>
+              <select value={deliveryFilters.latest_status} onChange={(event) => updateFilter('latest_status', event.target.value)}>
+                <option value="all">全部</option>
+                <option value="passed">通过</option>
+                <option value="failed">失败</option>
+                <option value="skipped">跳过</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>交付物</span>
+              <select value={deliveryFilters.deliverable_type} onChange={(event) => updateFilter('deliverable_type', event.target.value)}>
+                <option value="all">全部类型</option>
+                <option value="test-cases">用例文档</option>
+                <option value="spec">自动化脚本</option>
+                <option value="manual-report">人工报告</option>
+                <option value="html-report">HTML report</option>
+                <option value="execution-preview">执行证据</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>更新起始</span>
+              <input type="date" value={deliveryFilters.updated_from} onChange={(event) => updateFilter('updated_from', event.target.value)} />
+            </label>
+            <label className="field">
+              <span>更新截止</span>
+              <input type="date" value={deliveryFilters.updated_to} onChange={(event) => updateFilter('updated_to', event.target.value)} />
+            </label>
+          </div>
+        )}
+      </div>
+
+      <div className="delivery-toolbar">
+        <span>{deliveryReport.total || 0} 条匹配记录 · 第 {deliveryReport.page || 1}/{totalPages} 页</span>
+        <div className="segmented-control" aria-label="视图密度">
+          <button type="button" className={density === 'cards' ? 'active' : ''} onClick={() => setDensity('cards')}>卡片</button>
+          <button type="button" className={density === 'compact' ? 'active' : ''} onClick={() => setDensity('compact')}>紧凑</button>
+        </div>
+      </div>
+
+      <div className={density === 'compact' ? 'delivery-review-list compact' : 'delivery-review-list'} data-testid="delivery-report-table">
         {rows.length ? rows.map((row) => {
           const caseItem = row.case || {};
-          const isExpanded = expandedCaseId === caseItem.id;
-          const previewItems = expandedDeliverables[caseItem.id] || row.deliverables || [];
+          const isSelected = selectedCaseId === caseItem.id;
           const latestStatus = caseItem.latestStatus || row.latestRun?.status || '';
+          const missingText = row.missingTypes?.length ? `缺失：${row.missingTypes.map(deliveryTypeLabel).join('、')}` : '四件套齐全';
           return (
-            <React.Fragment key={caseItem.id}>
-              <div className={isExpanded ? 'delivery-report-row expanded' : 'delivery-report-row'} role="button" tabIndex={0} onClick={() => loadPreview(row)} onKeyDown={(event) => (event.key === 'Enter' || event.key === ' ') && loadPreview(row)}>
-                <span>{row.project?.name || '未归属项目'}</span>
-                <span>
+            <article className={isSelected ? 'delivery-case-card selected' : 'delivery-case-card'} key={caseItem.id} role="button" tabIndex={0} onClick={() => loadDetail(row)} onKeyDown={(event) => (event.key === 'Enter' || event.key === ' ') && loadDetail(row)}>
+              <div className="delivery-case-main">
+                <span className={`delivery-readiness-pill ${row.readiness || 'missing'}`}>{readinessLabel(row.readiness)}</span>
+                <div>
                   <strong>{caseItem.externalId || caseItem.id}</strong>
-                  <small>{caseItem.title || '未命名用例'}</small>
-                  {row.workItem?.title ? <small>{row.workItem.title}</small> : null}
-                </span>
+                  <h3>{caseItem.title || '未命名用例'}</h3>
+                  <p>{row.project?.name || '未归属项目'}{row.workItem?.title ? ` · ${row.workItem.title}` : ''}</p>
+                </div>
+              </div>
+              <div className="delivery-case-meta">
                 <span>{caseItem.priority || '-'}</span>
                 <span>{statusLabel(caseItem.automationStatus || 'manual')}</span>
-                <span className={latestStatus || 'idle'}>{latestStatus ? statusLabel(latestStatus) : '暂无'}</span>
-                <span>{renderDeliverableState(row, 'test-cases')}</span>
-                <span>{renderDeliverableState(row, 'spec')}</span>
-                <span>{renderDeliverableState(row, 'manual-report')}</span>
-                <span>{renderDeliverableState(row, 'html-report')}</span>
-                <span>{renderDeliverableState(row, 'execution-preview')}</span>
+                <span className={latestStatus || 'idle'}>{latestStatus ? statusLabel(latestStatus) : '暂无结果'}</span>
                 <span>{formatDateTime(row.updatedAt || caseItem.updatedAt)}</span>
               </div>
-              {isExpanded && (
-                <div className="delivery-preview-panel">
-                  {previewLoading ? <p className="muted">正在读取交付物预览...</p> : null}
-                  {previewItems.length ? previewItems.map((deliverable) => (
-                    <article className="deliverable-card" key={deliverable.id}>
-                      <div className="panel-heading compact">
-                        <h3>{deliverable.name}</h3>
-                        <span className="source-chip">v{deliverable.version || 1} · {deliveryTypeLabel(deliverable.type)}</span>
-                      </div>
-                      <div className="delivery-row"><span>状态</span><strong>{statusLabel(deliverable.status)}</strong></div>
-                      <div className="delivery-row"><span>路径</span><strong>{deliverable.filePath || '-'}</strong></div>
-                      <p className="muted">{deliverable.summary || '暂无摘要'}</p>
-                      {deliverable.type === 'manual-report' ? (
-                        <a className="report-link inline-report-link" href={deliverableReportUrl(deliverable)} target="_blank" rel="noreferrer">
-                          <FileText size={16} />
-                          打开渲染报告
-                          <ExternalLink size={14} />
-                        </a>
-                      ) : deliverable.type === 'html-report' ? (
-                        <a className="report-link inline-report-link" href={playwrightReportUrl()} target="_blank" rel="noreferrer">
-                          <FileText size={16} />
-                          打开 HTML Report
-                          <ExternalLink size={14} />
-                        </a>
-                      ) : null}
-                      {deliverable.content ? (
-                        <pre className="deliverable-preview">{deliverable.content.slice(0, 2400)}</pre>
-                      ) : null}
-                    </article>
-                  )) : <p className="muted">该用例暂无交付物，当前状态为待生成。</p>}
-                </div>
-              )}
-            </React.Fragment>
+              <div className="delivery-chip-row">
+                {REQUIRED_DELIVERY_TYPES.map((type) => renderDeliverableChip(row, type))}
+                {renderDeliverableChip(row, 'execution-preview')}
+              </div>
+              <div className="delivery-case-footer">
+                <span>{missingText}</span>
+                {renderPrimaryAction(row)}
+              </div>
+            </article>
           );
         }) : <p className="muted">没有匹配的用例记录。</p>}
       </div>
+
+      {selectedRow && (
+        <aside className="delivery-detail-panel" aria-label="交付详情">
+          <div className="panel-heading compact">
+            <div>
+              <h3>{selectedRow.case?.externalId || selectedRow.case?.id}</h3>
+              <p className="muted">{selectedRow.case?.title}</p>
+            </div>
+            <button type="button" className="ghost-icon-button" aria-label="关闭交付详情" onClick={() => setSelectedCaseId('')}>
+              <X size={16} />
+            </button>
+          </div>
+          {previewLoading ? <p className="muted">正在读取交付物详情...</p> : null}
+          <div className="delivery-detail-grid">
+            {selectedDeliverables.length ? selectedDeliverables.map((deliverable) => {
+              const isPreviewOpen = Boolean(contentPreviewOpen[deliverable.id]);
+              return (
+                <article className="deliverable-card" key={deliverable.id}>
+                  <div className="panel-heading compact">
+                    <h3>{deliverable.name}</h3>
+                    <span className="source-chip">v{deliverable.version || 1} · {deliveryTypeLabel(deliverable.type)}</span>
+                  </div>
+                  <div className="delivery-row"><span>状态</span><strong>{statusLabel(deliverable.status)}</strong></div>
+                  <div className="delivery-row"><span>路径</span><strong>{deliverable.filePath || '-'}</strong></div>
+                  <p className="muted">{deliverable.summary || '暂无摘要'}</p>
+                  <div className="action-row">
+                    {deliverableHref(deliverable) ? (
+                      <a className="report-link inline-report-link" href={deliverableHref(deliverable)} target="_blank" rel="noreferrer">
+                        <FileText size={16} />
+                        {deliverable.type === 'html-report' ? '打开 HTML Report' : '打开渲染报告'}
+                        <ExternalLink size={14} />
+                      </a>
+                    ) : null}
+                    {deliverable.content ? (
+                      <button type="button" className="ghost-button" onClick={() => setContentPreviewOpen((current) => ({ ...current, [deliverable.id]: !current[deliverable.id] }))}>
+                        <Eye size={15} />
+                        {isPreviewOpen ? '收起内容预览' : '查看内容预览'}
+                      </button>
+                    ) : null}
+                  </div>
+                  {isPreviewOpen && deliverable.content ? (
+                    <pre className="deliverable-preview">{deliverable.content.slice(0, 2400)}</pre>
+                  ) : null}
+                </article>
+              );
+            }) : <p className="muted">该用例暂无交付物，当前状态为缺失。</p>}
+          </div>
+        </aside>
+      )}
 
       <div className="delivery-pagination">
         <button type="button" className="ghost-button" disabled={(deliveryReport.page || 1) <= 1} onClick={() => applyFilters((deliveryReport.page || 1) - 1)}>
@@ -6814,6 +8665,10 @@ function Delivery({ item, projects, deliveryReport, deliveryFilters, setDelivery
       </div>
     </section>
   );
+}
+
+function SlidersHorizontalFallback() {
+  return <Settings size={16} />;
 }
 
 function Field({ label, value, onChange, textarea = false }) {

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import re
@@ -7,17 +8,19 @@ import shutil
 import sqlite3
 import contextlib
 import html
+import hmac
 import urllib.parse
 import urllib.request
 import urllib.error
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -27,6 +30,7 @@ PROJECT_ARTIFACT_DIR = ROOT_DIR / "artifacts" / "projects"
 FLOW_RUN_ARTIFACT_DIR = ARTIFACT_DIR / "flow-runs"
 SCREENSHOT_PATH = ARTIFACT_DIR / "browser-preview.svg"
 REPORT_INDEX = ROOT_DIR / "playwright-report" / "index.html"
+PLAYWRIGHT_REPORT_ARCHIVE_DIR = ARTIFACT_DIR / "playwright-reports"
 DISCOVERY_DIR = ARTIFACT_DIR / "discovery"
 BROWSER_WORKER_PATH = ROOT_DIR / "backend" / "app" / "browser_worker.cjs"
 EXECUTION_LIVE_DIR = ROOT_DIR / "tests" / "e2e" / ".live-runs"
@@ -38,12 +42,31 @@ DEFAULT_PROJECT_SLUG = "local-qa-project"
 DEFAULT_PROJECT_CODE = "PRJ-LOCAL-QA"
 PROJECT_TYPE_VALUES = {"product", "delivery"}
 PROJECT_STATUS_VALUES = {"planning", "active", "paused", "completed", "archived"}
+REQUIRED_DELIVERY_TYPES = ("test-cases", "spec", "manual-report", "html-report")
 EXPLORATION_TIME_BUDGET_SECONDS = 300
 EXPLORATION_STEP_TIMEOUT_SECONDS = 30
 BROWSER_FRAME_SEND_TIMEOUT_SECONDS = 0.2
 BROWSER_EVENT_SEND_TIMEOUT_SECONDS = 1.0
 BROWSER_WORKER_STREAM_LIMIT_BYTES = 16 * 1024 * 1024
 AUTOMATION_FLOW_EVENT_SEND_TIMEOUT_SECONDS = 1.0
+ASSET_MODE_VALUES = {"create", "refresh", "append"}
+AUTH_COOKIE_NAME = "qa_auth_session"
+AUTH_SESSION_HOURS = 8
+PASSWORD_HASH_ITERATIONS = 210_000
+DEFAULT_ADMIN_USERNAME = "admin"
+DEFAULT_ADMIN_PASSWORD = "admin123456"
+USER_ROLES = {"admin", "lead", "executor", "viewer"}
+USER_STATUSES = {"pending", "active", "disabled"}
+CORS_ALLOWED_ORIGINS = {
+    "http://127.0.0.1:5174",
+    "http://localhost:5174",
+    "http://127.0.0.1:5175",
+    "http://localhost:5175",
+    "http://127.0.0.1:5176",
+    "http://localhost:5176",
+    "http://127.0.0.1:5177",
+    "http://localhost:5177",
+}
 
 STAGES = [
     ("prepare", "准备环境", 12),
@@ -122,12 +145,16 @@ class WorkItemRequest(BaseModel):
     test_data: str = ""
     acceptance: str = ""
     exclusions: str = ""
+    asset_mode: str = "create"
+    case_ids: list[str] = Field(default_factory=list)
 
 
 class AutomationFlowRequest(BaseModel):
     requirement: str
     project_id: str = ""
     feature_id: str = ""
+    asset_mode: str = "create"
+    case_ids: list[str] = Field(default_factory=list)
 
 
 class ExplorationRequest(BaseModel):
@@ -139,12 +166,20 @@ class ExplorationRequest(BaseModel):
 
 class ContentRequest(BaseModel):
     content: str = ""
+    asset_mode: str = ""
+    case_ids: list[str] = Field(default_factory=list)
 
 
 class SaveArtifactsRequest(BaseModel):
     cases_markdown: str = ""
     script_content: str = ""
     report_content: str = ""
+    asset_mode: str = ""
+    case_ids: list[str] = Field(default_factory=list)
+
+
+class ScriptDraftRequest(BaseModel):
+    content: str = ""
 
 
 class HealRequest(BaseModel):
@@ -153,9 +188,16 @@ class HealRequest(BaseModel):
 
 
 class AIConfigRequest(BaseModel):
+    id: str = ""
+    name: str = ""
+    provider: str = "openai"
     api_key: str = ""
     model: str = ""
     base_url: str = ""
+
+
+class AIActiveConfigRequest(BaseModel):
+    profile_id: str = ""
 
 
 class ProjectRequest(BaseModel):
@@ -207,6 +249,10 @@ class TestCasePatchRequest(BaseModel):
     automation_notes: Optional[str] = None
     automation_status: Optional[str] = None
     spec_path: Optional[str] = None
+
+
+class TestCaseBulkDeleteRequest(BaseModel):
+    case_ids: list[str] = Field(default_factory=list)
 
 
 class FeatureMenuRequest(BaseModel):
@@ -268,6 +314,40 @@ class SuiteRunRequest(BaseModel):
     case_ids: list[str] = Field(default_factory=list)
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class RegisterRequest(BaseModel):
+    username: str
+    display_name: str = ""
+    password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class UserCreateRequest(BaseModel):
+    username: str
+    display_name: str = ""
+    password: str
+    role: str = "viewer"
+    status: str = "active"
+
+
+class UserPatchRequest(BaseModel):
+    display_name: Optional[str] = None
+    role: Optional[str] = None
+    status: Optional[str] = None
+
+
+class ResetPasswordRequest(BaseModel):
+    password: str
+
+
 class BrowserRuntime:
     def __init__(
         self,
@@ -303,20 +383,283 @@ AUTOMATION_FLOW_EVENT_LOOP: asyncio.AbstractEventLoop | None = None
 app = FastAPI(title="QA Automation Platform", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://127.0.0.1:5174",
-        "http://localhost:5174",
-        "http://127.0.0.1:5175",
-        "http://localhost:5175",
-        "http://127.0.0.1:5176",
-        "http://localhost:5176",
-        "http://127.0.0.1:5177",
-        "http://localhost:5177",
-    ],
+    allow_origins=sorted(CORS_ALLOWED_ORIGINS),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def auth_disabled() -> bool:
+    return os.environ.get("QA_AUTH_DISABLED") == "1"
+
+
+def json_auth_response(request: Request, payload: dict[str, Any], status_code: int) -> JSONResponse:
+    response = JSONResponse(payload, status_code=status_code)
+    origin = request.headers.get("origin")
+    if origin in CORS_ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers.add_vary_header("Origin")
+    return response
+
+
+def normalize_username(value: str) -> str:
+    return re.sub(r"\s+", "", value.strip().lower())
+
+
+def validate_username(value: str) -> str:
+    username = normalize_username(value)
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]{3,32}", username):
+        raise HTTPException(status_code=400, detail="账号需为 3-32 位字母、数字、点、下划线或短横线")
+    return username
+
+
+def validate_password(value: str) -> str:
+    password = value or ""
+    if len(password) < 8 or not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
+        raise HTTPException(status_code=400, detail="密码至少 8 位，并包含字母和数字")
+    return password
+
+
+def hash_password(password: str, salt: str | None = None) -> str:
+    active_salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        active_salt.encode("utf-8"),
+        PASSWORD_HASH_ITERATIONS,
+    ).hex()
+    return f"pbkdf2_sha256${PASSWORD_HASH_ITERATIONS}${active_salt}${digest}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        algorithm, iterations, salt, expected = stored_hash.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), int(iterations)).hex()
+        return hmac.compare_digest(digest, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def hash_session_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def row_to_user(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "displayName": row["display_name"],
+        "role": row["role"],
+        "status": row["status"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+        "lastLoginAt": row["last_login_at"] if "last_login_at" in row.keys() else "",
+    }
+
+
+def system_user() -> dict[str, Any]:
+    timestamp = now_iso()
+    return {
+        "id": "auth-disabled-user",
+        "username": "auth-disabled",
+        "displayName": "本地测试用户",
+        "role": "admin",
+        "status": "active",
+        "createdAt": timestamp,
+        "updatedAt": timestamp,
+        "lastLoginAt": timestamp,
+    }
+
+
+def write_audit_log(
+    event_type: str,
+    message: str,
+    *,
+    actor_user_id: str = "",
+    target_user_id: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    with contextlib.suppress(Exception):
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO audit_logs (
+                    id, actor_user_id, target_user_id, event_type, message, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid.uuid4().hex[:12],
+                    actor_user_id,
+                    target_user_id,
+                    event_type,
+                    message,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    now_iso(),
+                ),
+            )
+
+
+def create_session(user_id: str) -> tuple[str, str]:
+    session_id = uuid.uuid4().hex[:12]
+    token = secrets.token_urlsafe(48)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=AUTH_SESSION_HOURS)
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO auth_sessions (
+                id, user_id, token_hash, created_at, last_seen_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, user_id, hash_session_token(token), now_iso(), now_iso(), expires_at.isoformat()),
+        )
+    return session_id, token
+
+
+def clear_session(token: str) -> None:
+    if not token:
+        return
+    with get_db() as conn:
+        conn.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (hash_session_token(token),))
+
+
+def cookie_options() -> dict[str, Any]:
+    return {
+        "httponly": True,
+        "samesite": "lax",
+        "secure": os.environ.get("QA_AUTH_COOKIE_SECURE") == "1",
+        "path": "/",
+    }
+
+
+def set_auth_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        AUTH_COOKIE_NAME,
+        token,
+        max_age=AUTH_SESSION_HOURS * 60 * 60,
+        **cookie_options(),
+    )
+
+
+def delete_auth_cookie(response: Response) -> None:
+    response.delete_cookie(AUTH_COOKIE_NAME, path="/", samesite="lax")
+
+
+def user_from_session_token(token: str | None, *, refresh: bool = True) -> dict[str, Any] | None:
+    if auth_disabled():
+        return system_user()
+    if not token:
+        return None
+    token_hash = hash_session_token(token)
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT s.id AS session_id, s.expires_at, u.*
+            FROM auth_sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.token_hash = ?
+            """,
+            (token_hash,),
+        ).fetchone()
+        if row is None:
+            return None
+        expires_at = parse_iso_datetime(row["expires_at"])
+        if expires_at is None or expires_at <= datetime.now(timezone.utc):
+            conn.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
+            return None
+        if row["status"] != "active":
+            conn.execute("DELETE FROM auth_sessions WHERE user_id = ?", (row["id"],))
+            return None
+        if refresh:
+            next_expires_at = datetime.now(timezone.utc) + timedelta(hours=AUTH_SESSION_HOURS)
+            conn.execute(
+                "UPDATE auth_sessions SET last_seen_at = ?, expires_at = ? WHERE id = ?",
+                (now_iso(), next_expires_at.isoformat(), row["session_id"]),
+            )
+        return row_to_user(row)
+
+
+def current_user_from_request(request: Request) -> dict[str, Any] | None:
+    return getattr(request.state, "user", None)
+
+
+def current_user_from_websocket(websocket: WebSocket) -> dict[str, Any] | None:
+    return user_from_session_token(websocket.cookies.get(AUTH_COOKIE_NAME), refresh=True)
+
+
+def has_role(user: dict[str, Any] | None, roles: set[str]) -> bool:
+    return bool(user and user.get("role") in roles)
+
+
+def require_current_user(request: Request) -> dict[str, Any]:
+    user = current_user_from_request(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="请先登录")
+    return user
+
+
+def require_role_user(request: Request, roles: set[str]) -> dict[str, Any]:
+    user = require_current_user(request)
+    if user["role"] not in roles:
+        raise HTTPException(status_code=403, detail="当前账号无权执行该操作")
+    return user
+
+
+def route_allowed_without_auth(path: str, method: str) -> bool:
+    if method == "OPTIONS":
+        return True
+    if path == "/api/health":
+        return True
+    if path in {"/api/auth/login", "/api/auth/logout", "/api/auth/register", "/api/auth/me"}:
+        return True
+    if path == "/api/test/reset":
+        return os.environ.get("QA_TEST_RESET_ENABLED") == "1"
+    return False
+
+
+def path_permission(path: str, method: str) -> set[str] | None:
+    if method in {"GET", "HEAD", "OPTIONS"}:
+        if path.startswith("/api/ai-config") and path.endswith("/secret"):
+            return {"admin"}
+        return USER_ROLES
+    if path.startswith("/api/users") or path.startswith("/api/ai-config"):
+        return {"admin"}
+    if path.startswith("/api/projects") or path.startswith("/api/features") or path.startswith("/api/test-suites"):
+        return {"admin", "lead"} if method == "DELETE" else {"admin", "lead"}
+    if path == "/api/test-cases/bulk-delete":
+        return {"admin", "lead"}
+    if path.startswith("/api/test-cases") or path.startswith("/api/deliverables"):
+        return {"admin", "lead"} if method == "DELETE" else {"admin", "lead", "executor"}
+    if path.startswith("/api/work-items"):
+        if path.endswith("/save-artifacts"):
+            return {"admin", "lead"}
+        return {"admin", "lead", "executor"}
+    if path.startswith("/api/script-versions"):
+        return USER_ROLES if method == "GET" else {"admin", "lead", "executor"}
+    if path.startswith("/api/automation-flows") or path.startswith("/api/suite-runs") or path.startswith("/api/runs"):
+        return {"admin", "lead", "executor"}
+    return USER_ROLES
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    method = request.method.upper()
+    if auth_disabled() or route_allowed_without_auth(path, method):
+        request.state.user = system_user() if auth_disabled() else user_from_session_token(request.cookies.get(AUTH_COOKIE_NAME), refresh=path == "/api/auth/me")
+        return await call_next(request)
+
+    user = user_from_session_token(request.cookies.get(AUTH_COOKIE_NAME))
+    if user is None:
+        return json_auth_response(request, {"detail": "请先登录"}, 401)
+    allowed_roles = path_permission(path, method)
+    if allowed_roles is not None and user["role"] not in allowed_roles:
+        return json_auth_response(request, {"detail": "当前账号无权执行该操作"}, 403)
+    request.state.user = user
+    return await call_next(request)
 
 
 def now_iso() -> str:
@@ -355,6 +698,31 @@ def add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, def
         pass
 
 
+def ensure_default_admin(conn: sqlite3.Connection) -> None:
+    existing = conn.execute("SELECT id FROM users WHERE username = ?", (DEFAULT_ADMIN_USERNAME,)).fetchone()
+    if existing is not None:
+        return
+    timestamp = now_iso()
+    conn.execute(
+        """
+        INSERT INTO users (
+            id, username, display_name, role, status, password_hash,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            uuid.uuid4().hex[:12],
+            DEFAULT_ADMIN_USERNAME,
+            "系统管理员",
+            "admin",
+            "active",
+            hash_password(DEFAULT_ADMIN_PASSWORD),
+            timestamp,
+            timestamp,
+        ),
+    )
+
+
 def init_db() -> None:
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     PROJECT_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
@@ -384,7 +752,6 @@ def init_db() -> None:
             ("status", "TEXT NOT NULL DEFAULT 'active'"),
         ]:
             add_column_if_missing(conn, "projects", column, definition)
-        conn.execute("UPDATE projects SET project_code = ? WHERE id = ? AND (project_code IS NULL OR project_code = '')", (DEFAULT_PROJECT_CODE, DEFAULT_PROJECT_ID))
         conn.execute("UPDATE projects SET project_type = 'product' WHERE project_type IS NULL OR project_type = ''")
         conn.execute("UPDATE projects SET status = 'active' WHERE status IS NULL OR status = ''")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_project_code ON projects(project_code)")
@@ -405,13 +772,15 @@ def init_db() -> None:
                 report_path TEXT,
                 screenshot_path TEXT,
                 work_item_id TEXT,
-                browser_session_id TEXT
+                browser_session_id TEXT,
+                script_version_id TEXT
             )
             """
         )
         for column, definition in [
             ("work_item_id", "TEXT"),
             ("browser_session_id", "TEXT"),
+            ("script_version_id", "TEXT"),
         ]:
             add_column_if_missing(conn, "runs", column, definition)
         conn.execute(
@@ -460,13 +829,17 @@ def init_db() -> None:
                 latest_run_id TEXT,
                 analysis_json TEXT,
                 project_id TEXT,
-                feature_id TEXT
+                feature_id TEXT,
+                asset_mode TEXT NOT NULL DEFAULT 'create',
+                case_ids_json TEXT
             )
             """
         )
         add_column_if_missing(conn, "work_items", "analysis_json", "TEXT")
         add_column_if_missing(conn, "work_items", "project_id", "TEXT")
         add_column_if_missing(conn, "work_items", "feature_id", "TEXT")
+        add_column_if_missing(conn, "work_items", "asset_mode", "TEXT NOT NULL DEFAULT 'create'")
+        add_column_if_missing(conn, "work_items", "case_ids_json", "TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS automation_flow_runs (
@@ -484,12 +857,16 @@ def init_db() -> None:
                 report_path TEXT,
                 html_report_path TEXT,
                 error TEXT,
+                asset_mode TEXT NOT NULL DEFAULT 'create',
+                case_ids_json TEXT,
                 started_at TEXT NOT NULL,
                 ended_at TEXT
             )
             """
         )
         add_column_if_missing(conn, "automation_flow_runs", "feature_id", "TEXT")
+        add_column_if_missing(conn, "automation_flow_runs", "asset_mode", "TEXT NOT NULL DEFAULT 'create'")
+        add_column_if_missing(conn, "automation_flow_runs", "case_ids_json", "TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS automation_flow_artifacts (
@@ -681,20 +1058,30 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 work_item_id TEXT NOT NULL,
                 content TEXT NOT NULL,
+                asset_mode TEXT NOT NULL DEFAULT 'create',
+                case_ids_json TEXT,
                 created_at TEXT NOT NULL
             )
             """
         )
+        add_column_if_missing(conn, "generated_cases", "asset_mode", "TEXT NOT NULL DEFAULT 'create'")
+        add_column_if_missing(conn, "generated_cases", "case_ids_json", "TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS generated_scripts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 work_item_id TEXT NOT NULL,
                 content TEXT NOT NULL,
+                script_version_id TEXT,
+                asset_mode TEXT NOT NULL DEFAULT 'create',
+                case_ids_json TEXT,
                 created_at TEXT NOT NULL
             )
             """
         )
+        add_column_if_missing(conn, "generated_scripts", "script_version_id", "TEXT")
+        add_column_if_missing(conn, "generated_scripts", "asset_mode", "TEXT NOT NULL DEFAULT 'create'")
+        add_column_if_missing(conn, "generated_scripts", "case_ids_json", "TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS healing_attempts (
@@ -717,6 +1104,52 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                role TEXT NOT NULL,
+                status TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_login_at TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_status_role ON users(status, role)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id TEXT PRIMARY KEY,
+                actor_user_id TEXT,
+                target_user_id TEXT,
+                event_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_event ON audit_logs(event_type)")
+        ensure_default_admin(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS test_cases (
@@ -743,6 +1176,45 @@ def init_db() -> None:
         )
         add_column_if_missing(conn, "test_cases", "feature_id", "TEXT")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_test_cases_project_external ON test_cases(project_id, external_id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS test_script_versions (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                work_item_id TEXT NOT NULL,
+                exploration_run_id TEXT,
+                source_generated_script_id INTEGER,
+                version INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                spec_path TEXT,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                asset_mode TEXT NOT NULL DEFAULT 'create',
+                case_ids_json TEXT,
+                verified_run_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS test_case_script_bindings (
+                id TEXT PRIMARY KEY,
+                case_id TEXT NOT NULL,
+                script_version_id TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                test_title TEXT,
+                grep_pattern TEXT,
+                is_active INTEGER NOT NULL DEFAULT 0,
+                bound_by_source TEXT NOT NULL,
+                bound_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_script_versions_work_item ON test_script_versions(work_item_id, version)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_case_script_bindings_case ON test_case_script_bindings(case_id, is_active)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_active_case_script_binding ON test_case_script_bindings(case_id) WHERE is_active = 1")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS feature_menus (
@@ -846,7 +1318,6 @@ def init_db() -> None:
             """
         )
         migrate_project_case_deliverable_data(conn)
-        ensure_default_project(conn)
 
 
 def slugify(value: str) -> str:
@@ -933,65 +1404,50 @@ def safe_child_path(root: Path, path_value: str) -> Path:
     return candidate
 
 
-def default_project_payload() -> dict[str, str]:
-    context = project_context()
-    return {
-        "id": DEFAULT_PROJECT_ID,
-        "slug": DEFAULT_PROJECT_SLUG,
-        "project_code": DEFAULT_PROJECT_CODE,
-        "name": "本地 QA 自动化项目",
-        "project_type": "product",
-        "status": "active",
-        "target_url": "",
-        "repository_path": str(ROOT_DIR),
-        "test_dir": context.get("testDir", "tests/e2e"),
-        "description": "由历史工单和仓库测试资产迁移生成的默认项目。",
-    }
+def run_html_report_index(run_id: str) -> Path:
+    return PLAYWRIGHT_REPORT_ARCHIVE_DIR / "runs" / run_id / "index.html"
 
 
-def ensure_default_project(conn: sqlite3.Connection) -> str:
-    payload = default_project_payload()
-    timestamp = now_iso()
-    conn.execute(
-        """
-        INSERT INTO projects (
-            id, slug, project_code, name, project_type, status,
-            target_url, repository_path, test_dir, description,
-            created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            project_code = CASE
-                WHEN projects.project_code IS NULL OR projects.project_code = '' THEN excluded.project_code
-                ELSE projects.project_code
-            END,
-            project_type = CASE
-                WHEN projects.project_type IS NULL OR projects.project_type = '' THEN excluded.project_type
-                ELSE projects.project_type
-            END,
-            status = CASE
-                WHEN projects.status IS NULL OR projects.status = '' THEN excluded.status
-                ELSE projects.status
-            END,
-            repository_path = excluded.repository_path,
-            test_dir = excluded.test_dir,
-            updated_at = excluded.updated_at
-        """,
-        (
-            payload["id"],
-            payload["slug"],
-            payload["project_code"],
-            payload["name"],
-            payload["project_type"],
-            payload["status"],
-            payload["target_url"],
-            payload["repository_path"],
-            payload["test_dir"],
-            payload["description"],
-            timestamp,
-            timestamp,
-        ),
+def suite_html_report_index(suite_run_id: str) -> Path:
+    return PLAYWRIGHT_REPORT_ARCHIVE_DIR / "suites" / suite_run_id / "index.html"
+
+
+def suite_blob_report_dir(suite_run_id: str) -> Path:
+    return PLAYWRIGHT_REPORT_ARCHIVE_DIR / "blobs" / suite_run_id
+
+
+def publish_latest_playwright_report(report_index: str | Path) -> None:
+    source = Path(report_index)
+    if not source.exists():
+        return
+    source_dir = source.parent.resolve()
+    target_dir = REPORT_INDEX.parent.resolve()
+    if source_dir == target_dir:
+        return
+    with contextlib.suppress(FileNotFoundError):
+        shutil.rmtree(target_dir)
+    shutil.copytree(source_dir, target_dir)
+
+
+def is_report_file_path(resolved: Path) -> bool:
+    try:
+        normalized_path = str(resolved.relative_to(ROOT_DIR.resolve())).lower()
+    except ValueError:
+        return False
+    normalized_name = resolved.name.lower()
+    archive_root = relative_or_absolute(PLAYWRIGHT_REPORT_ARCHIVE_DIR).lower().strip("/") + "/"
+    return (
+        normalized_name.endswith(("-report.md", "-test-report.md", "index.html"))
+        or "failure-report.md" in normalized_path
+        or normalized_path.startswith("playwright-report/")
+        or normalized_path.startswith(archive_root)
     )
-    return payload["id"]
+
+
+def report_file_redirect(path: str | Path) -> RedirectResponse:
+    relative_path = relative_or_absolute(path)
+    encoded_path = urllib.parse.quote(relative_path, safe="/")
+    return RedirectResponse(url=f"/reports/files/{encoded_path}", status_code=307)
 
 
 def row_to_project(row: sqlite3.Row) -> dict[str, Any]:
@@ -1013,18 +1469,22 @@ def row_to_project(row: sqlite3.Row) -> dict[str, Any]:
 
 def get_project_row(project_id: str) -> sqlite3.Row:
     with get_db() as conn:
-        row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id or DEFAULT_PROJECT_ID,)).fetchone()
+        row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Project not found")
     return row
 
 
 def normalize_project_id(project_id: str | None) -> str:
-    return project_id or DEFAULT_PROJECT_ID
+    return (project_id or "").strip()
 
 
-def validate_project_id(conn: sqlite3.Connection, project_id: str | None) -> str:
+def validate_project_id(conn: sqlite3.Connection, project_id: str | None, *, required: bool = True) -> str:
     normalized_project_id = normalize_project_id(project_id)
+    if not normalized_project_id:
+        if required:
+            raise HTTPException(status_code=400, detail="项目为必填项，请选择项目管理中的有效项目")
+        return ""
     row = conn.execute("SELECT id FROM projects WHERE id = ?", (normalized_project_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=400, detail="项目不存在，请选择项目管理中的有效项目")
@@ -1423,6 +1883,14 @@ def looks_like_separator(cells: list[str]) -> bool:
     return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in cells)
 
 
+def clean_markdown_table_cell(value: str) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\\([\\`*_{}\[\]()#+.!|-])", r"\1", text)
+    for marker in ("**", "__", "`"):
+        text = text.replace(marker, "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def parse_cases_markdown(markdown: str) -> list[dict[str, str]]:
     lines = [line for line in markdown.splitlines() if line.strip().startswith("|")]
     if len(lines) < 2:
@@ -1438,7 +1906,7 @@ def parse_cases_markdown(markdown: str) -> list[dict[str, str]]:
             key = re.sub(r"\s+", "", name).lower()
             if key in normalized_headers:
                 index = normalized_headers.index(key)
-                return cells[index].strip() if index < len(cells) else ""
+                return clean_markdown_table_cell(cells[index]) if index < len(cells) else ""
         return ""
 
     cases: list[dict[str, str]] = []
@@ -1446,8 +1914,8 @@ def parse_cases_markdown(markdown: str) -> list[dict[str, str]]:
         cells = split_markdown_row(row)
         if len(cells) < 3:
             continue
-        external_id = value(cells, "ID", "用例ID", "编号") or cells[0].strip()
-        title = value(cells, "标题", "用例标题", "名称") or (cells[2].strip() if len(cells) > 2 else external_id)
+        external_id = value(cells, "ID", "用例ID", "编号") or clean_markdown_table_cell(cells[0])
+        title = value(cells, "标题", "用例标题", "名称") or (clean_markdown_table_cell(cells[2]) if len(cells) > 2 else external_id)
         if not external_id or not title:
             continue
         cases.append(
@@ -1493,6 +1961,179 @@ def validate_script_covers_cases(cases_markdown: str, script: str) -> None:
         raise HTTPException(status_code=400, detail=f"脚本未包含以下用例 ID：{', '.join(missing)}")
 
 
+def normalize_asset_mode(value: str | None, *, default: str = "create") -> str:
+    mode = (value or default or "create").strip().lower()
+    if mode not in ASSET_MODE_VALUES:
+        raise HTTPException(status_code=400, detail="资产模式必须为 create、refresh 或 append")
+    return mode
+
+
+def normalize_case_ids(case_ids: list[str] | None) -> list[str]:
+    return list(dict.fromkeys(str(case_id).strip() for case_id in (case_ids or []) if str(case_id).strip()))
+
+
+def json_case_ids(case_ids: list[str] | None) -> str:
+    return json.dumps(normalize_case_ids(case_ids), ensure_ascii=False)
+
+
+def validate_case_ids_for_project(conn: sqlite3.Connection, project_id: str, case_ids: list[str]) -> list[str]:
+    normalized = normalize_case_ids(case_ids)
+    if not normalized:
+        return []
+    placeholders = ",".join("?" for _ in normalized)
+    rows = conn.execute(
+        f"SELECT id, project_id FROM test_cases WHERE id IN ({placeholders})",
+        normalized,
+    ).fetchall()
+    by_id = {row["id"]: row for row in rows}
+    missing = [case_id for case_id in normalized if case_id not in by_id]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"存在无效用例：{', '.join(missing)}")
+    cross_project = [row["id"] for row in rows if row["project_id"] != project_id]
+    if cross_project:
+        raise HTTPException(status_code=400, detail=f"存在跨项目用例：{', '.join(cross_project)}")
+    return normalized
+
+
+def case_ids_for_work_item(conn: sqlite3.Connection, work_item_id: str) -> list[str]:
+    return [
+        row["id"]
+        for row in conn.execute(
+            "SELECT id FROM test_cases WHERE work_item_id = ? ORDER BY priority ASC, external_id ASC",
+            (work_item_id,),
+        ).fetchall()
+    ]
+
+
+def effective_case_ids(conn: sqlite3.Connection, project_id: str, work_item_id: str, case_ids: list[str] | None) -> list[str]:
+    normalized = normalize_case_ids(case_ids)
+    if not normalized and work_item_id:
+        normalized = case_ids_for_work_item(conn, work_item_id)
+    return validate_case_ids_for_project(conn, project_id, normalized)
+
+
+def work_item_asset_defaults(conn: sqlite3.Connection, item: sqlite3.Row, payload_mode: str = "", payload_case_ids: list[str] | None = None) -> tuple[str, list[str]]:
+    project_id = require_work_item_project_id(item)
+    case_ids = normalize_case_ids(payload_case_ids)
+    stored_case_ids = safe_json_loads(item["case_ids_json"] if "case_ids_json" in item.keys() else "", [])
+    if not case_ids and isinstance(stored_case_ids, list):
+        case_ids = normalize_case_ids([str(case_id) for case_id in stored_case_ids])
+    mode = normalize_asset_mode(payload_mode or (item["asset_mode"] if "asset_mode" in item.keys() else "") or ("refresh" if case_ids else "create"))
+    if mode in {"refresh", "append"}:
+        case_ids = effective_case_ids(conn, project_id, item["id"], case_ids)
+    else:
+        case_ids = validate_case_ids_for_project(conn, project_id, case_ids)
+    return mode, case_ids
+
+
+def require_work_item_project_id(item: sqlite3.Row) -> str:
+    project_id = item["project_id"] if "project_id" in item.keys() and item["project_id"] else ""
+    if not project_id:
+        raise HTTPException(status_code=400, detail="工单未绑定项目，请先选择项目")
+    return project_id
+
+
+def external_id_prefix_for_work_item(conn: sqlite3.Connection, work_item_id: str) -> str:
+    row = conn.execute("SELECT slug FROM work_items WHERE id = ?", (work_item_id,)).fetchone()
+    if row is None:
+        return f"TC-{uuid.uuid4().hex[:6].upper()}"
+    return f"TC-{row['slug'].upper()}"
+
+
+def unique_external_id(
+    conn: sqlite3.Connection,
+    project_id: str,
+    external_id: str,
+    work_item_id: str,
+    used_external_ids: set[str],
+) -> str:
+    cleaned = re.sub(r"\s+", "-", (external_id or "TC").strip().upper())[:72] or "TC"
+    if cleaned not in used_external_ids:
+        existing = conn.execute(
+            "SELECT id FROM test_cases WHERE project_id = ? AND external_id = ?",
+            (project_id, cleaned),
+        ).fetchone()
+        if existing is None:
+            used_external_ids.add(cleaned)
+            return cleaned
+    prefix = external_id_prefix_for_work_item(conn, work_item_id)
+    base = cleaned if cleaned.startswith(prefix) else f"{prefix}-{cleaned}"
+    base = base[:84].strip("-") or prefix
+    for index in range(1, 1000):
+        candidate = f"{base}-{index:03d}" if index > 1 else base
+        if candidate in used_external_ids:
+            continue
+        existing = conn.execute(
+            "SELECT id FROM test_cases WHERE project_id = ? AND external_id = ?",
+            (project_id, candidate),
+        ).fetchone()
+        if existing is None:
+            used_external_ids.add(candidate)
+            return candidate
+    candidate = f"{prefix}-{uuid.uuid4().hex[:8].upper()}"
+    used_external_ids.add(candidate)
+    return candidate
+
+
+def markdown_row(cells: list[str]) -> str:
+    return "| " + " | ".join(str(cell).replace("\n", " ").strip() for cell in cells) + " |"
+
+
+def rewrite_create_mode_case_ids(
+    conn: sqlite3.Connection,
+    project_id: str,
+    work_item_id: str,
+    markdown: str,
+    case_ids: list[str] | None = None,
+) -> str:
+    normalized_case_ids = validate_case_ids_for_project(conn, project_id, normalize_case_ids(case_ids))
+    existing_rows = []
+    if normalized_case_ids:
+        placeholders = ",".join("?" for _ in normalized_case_ids)
+        rows_by_id = {
+            row["id"]: row
+            for row in conn.execute(
+                f"SELECT * FROM test_cases WHERE id IN ({placeholders})",
+                normalized_case_ids,
+            ).fetchall()
+        }
+        existing_rows = [rows_by_id[case_id] for case_id in normalized_case_ids if case_id in rows_by_id]
+    prefix = external_id_prefix_for_work_item(conn, work_item_id)
+    used_external_ids = {row["external_id"] for row in existing_rows}
+    lines = markdown.splitlines()
+    next_lines: list[str] = []
+    header_seen = False
+    id_index = 0
+    data_index = 0
+    for line in lines:
+        if not line.strip().startswith("|"):
+            next_lines.append(line)
+            continue
+        cells = split_markdown_row(line)
+        if not header_seen:
+            normalized_headers = [re.sub(r"\s+", "", cell).lower() for cell in cells]
+            id_index = next((index for index, key in enumerate(normalized_headers) if key in {"id", "用例id", "编号"}), 0)
+            header_seen = True
+            next_lines.append(line)
+            continue
+        if looks_like_separator(cells):
+            next_lines.append(line)
+            continue
+        if id_index < len(cells):
+            if data_index < len(existing_rows):
+                cells[id_index] = existing_rows[data_index]["external_id"]
+            else:
+                original = clean_markdown_table_cell(cells[id_index]) or f"{data_index + 1:03d}"
+                desired = original if original.startswith(prefix) else f"{prefix}-{original}"
+                cells[id_index] = unique_external_id(conn, project_id, desired, work_item_id, used_external_ids)
+            data_index += 1
+            next_lines.append(markdown_row(cells))
+        else:
+            next_lines.append(line)
+    suffix = "\n" if markdown.endswith("\n") else ""
+    return "\n".join(next_lines) + suffix
+
+
 def sync_test_cases_from_markdown(
     conn: sqlite3.Connection,
     project_id: str,
@@ -1500,16 +2141,48 @@ def sync_test_cases_from_markdown(
     markdown: str,
     spec_path: str = "",
     default_feature_id: str = "",
+    asset_mode: str = "create",
+    case_ids: list[str] | None = None,
 ) -> list[str]:
     parsed = parse_cases_markdown(markdown)
     timestamp = now_iso()
     feature_id = validate_project_feature(conn, project_id, default_feature_id) if default_feature_id else ""
+    mode = normalize_asset_mode(asset_mode)
+    target_case_ids = validate_case_ids_for_project(conn, project_id, normalize_case_ids(case_ids))
+    target_rows = {}
+    target_rows_by_id = {}
+    target_rows_ordered = []
+    if target_case_ids:
+        placeholders = ",".join("?" for _ in target_case_ids)
+        fetched_target_rows = conn.execute(
+            f"SELECT * FROM test_cases WHERE id IN ({placeholders})",
+            target_case_ids,
+        ).fetchall()
+        target_rows_by_id = {row["id"]: row for row in fetched_target_rows}
+        target_rows = {row["external_id"]: row for row in fetched_target_rows}
+        target_rows_ordered = [target_rows_by_id[case_id] for case_id in target_case_ids if case_id in target_rows_by_id]
     case_ids: list[str] = []
-    for item in parsed:
-        existing = conn.execute(
-            "SELECT id FROM test_cases WHERE project_id = ? AND external_id = ?",
-            (project_id, item["external_id"]),
-        ).fetchone()
+    used_external_ids: set[str] = set()
+    for index, item in enumerate(parsed):
+        external_id = item["external_id"].strip()
+        existing = None
+        if mode in {"refresh", "append"}:
+            existing = target_rows.get(external_id)
+            if existing is None and index < len(target_rows_ordered):
+                existing = target_rows_ordered[index]
+            if existing is None and mode == "append":
+                existing = conn.execute(
+                    "SELECT * FROM test_cases WHERE project_id = ? AND external_id = ?",
+                    (project_id, external_id),
+                ).fetchone()
+        elif mode == "create":
+            existing = target_rows_ordered[index] if index < len(target_rows_ordered) else None
+            if existing is None:
+                external_id = unique_external_id(conn, project_id, external_id, work_item_id, used_external_ids)
+        if mode == "refresh" and existing is None:
+            raise HTTPException(status_code=400, detail=f"刷新模式下用例 ID 未绑定到本次目标用例：{external_id}")
+        if existing is not None:
+            external_id = existing["external_id"]
         case_id = existing["id"] if existing else uuid.uuid4().hex[:12]
         automation_status = "automated" if spec_path else "designed"
         conn.execute(
@@ -1547,7 +2220,7 @@ def sync_test_cases_from_markdown(
                 project_id,
                 work_item_id,
                 feature_id,
-                item["external_id"],
+                external_id,
                 item["title"],
                 item["priority"],
                 item["requirement"],
@@ -1565,9 +2238,288 @@ def sync_test_cases_from_markdown(
     return case_ids
 
 
+def content_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def active_script_binding_for_case(conn: sqlite3.Connection, case_id: str) -> dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT b.*, v.version, v.status, v.spec_path
+        FROM test_case_script_bindings b
+        JOIN test_script_versions v ON v.id = b.script_version_id
+        WHERE b.case_id = ? AND b.is_active = 1
+        ORDER BY b.bound_at DESC
+        LIMIT 1
+        """,
+        (case_id,),
+    ).fetchone()
+    if row is None:
+        return {}
+    return {
+        "scriptVersionId": row["script_version_id"],
+        "version": row["version"],
+        "status": row["status"],
+        "specPath": row["spec_path"],
+        "testTitle": row["test_title"] or "",
+        "grepPattern": row["grep_pattern"] or "",
+    }
+
+
+def active_spec_for_case(conn: sqlite3.Connection, case_row: sqlite3.Row) -> tuple[str, str, str]:
+    binding = active_script_binding_for_case(conn, case_row["id"])
+    spec_path = binding.get("specPath") or case_row["spec_path"] or ""
+    grep = binding.get("grepPattern") or re.escape(case_row["external_id"])
+    return spec_path, grep, binding.get("scriptVersionId", "")
+
+
+def row_to_script_version_detail(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    work_item = conn.execute("SELECT * FROM work_items WHERE id = ?", (row["work_item_id"],)).fetchone()
+    project = conn.execute("SELECT * FROM projects WHERE id = ?", (row["project_id"],)).fetchone()
+    bound_rows = conn.execute(
+        """
+        SELECT b.*, tc.title, tc.project_id, tc.work_item_id, tc.priority, tc.automation_status, tc.latest_status
+        FROM test_case_script_bindings b
+        JOIN test_cases tc ON tc.id = b.case_id
+        WHERE b.script_version_id = ?
+        ORDER BY b.is_active DESC, tc.priority ASC, tc.external_id ASC
+        """,
+        (row["id"],),
+    ).fetchall()
+    case_ids = safe_json_loads(row["case_ids_json"] if "case_ids_json" in row.keys() else "", [])
+    return {
+        "id": row["id"],
+        "projectId": row["project_id"],
+        "project": row_to_project(project) if project else None,
+        "workItemId": row["work_item_id"],
+        "workItem": row_to_work_item(work_item) if work_item else None,
+        "explorationRunId": row["exploration_run_id"] if "exploration_run_id" in row.keys() else "",
+        "sourceGeneratedScriptId": row["source_generated_script_id"] if "source_generated_script_id" in row.keys() else None,
+        "version": row["version"],
+        "status": row["status"],
+        "specPath": row["spec_path"],
+        "content": row["content"],
+        "contentHash": row["content_hash"],
+        "assetMode": row["asset_mode"] if "asset_mode" in row.keys() and row["asset_mode"] else "create",
+        "caseIds": normalize_case_ids(case_ids if isinstance(case_ids, list) else []),
+        "verifiedRunId": row["verified_run_id"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+        "boundCases": [
+            {
+                "id": item["case_id"],
+                "projectId": item["project_id"],
+                "workItemId": item["work_item_id"],
+                "externalId": item["external_id"],
+                "title": item["title"],
+                "priority": item["priority"],
+                "automationStatus": item["automation_status"],
+                "latestStatus": item["latest_status"],
+                "testTitle": item["test_title"] or "",
+                "grepPattern": item["grep_pattern"] or "",
+                "isActive": bool(item["is_active"]),
+                "boundBySource": item["bound_by_source"],
+                "boundAt": item["bound_at"],
+            }
+            for item in bound_rows
+        ],
+    }
+
+
+def latest_script_version_for_work_item(conn: sqlite3.Connection, work_item_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM test_script_versions WHERE work_item_id = ? ORDER BY version DESC, created_at DESC LIMIT 1",
+        (work_item_id,),
+    ).fetchone()
+
+
+def next_script_version_number(conn: sqlite3.Connection, work_item_id: str) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(MAX(version), 0) AS version FROM test_script_versions WHERE work_item_id = ?",
+        (work_item_id,),
+    ).fetchone()
+    return int(row["version"] or 0) + 1
+
+
+def script_version_path(item: sqlite3.Row, script_version_id: str, status: str = "draft") -> str:
+    WORK_ITEM_DRAFT_DIR.mkdir(parents=True, exist_ok=True)
+    suffix = "active" if status == "active" else "draft"
+    spec_path = WORK_ITEM_DRAFT_DIR / item["slug"] / f"{script_version_id}.{suffix}.spec.ts"
+    spec_path.parent.mkdir(parents=True, exist_ok=True)
+    return relative_or_absolute(spec_path)
+
+
+def create_script_version(
+    conn: sqlite3.Connection,
+    item: sqlite3.Row,
+    content: str,
+    *,
+    asset_mode: str,
+    case_ids: list[str],
+    source_generated_script_id: int | None = None,
+    exploration_run_id: str = "",
+) -> str:
+    version_id = uuid.uuid4().hex[:12]
+    version = next_script_version_number(conn, item["id"])
+    relative_spec = script_version_path(item, version_id)
+    resolve_workspace_path(relative_spec).write_text(content, encoding="utf-8")
+    timestamp = now_iso()
+    conn.execute(
+        """
+        INSERT INTO test_script_versions (
+            id, project_id, work_item_id, exploration_run_id, source_generated_script_id,
+            version, status, spec_path, content, content_hash, asset_mode,
+            case_ids_json, verified_run_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            version_id,
+            item["project_id"] or "",
+            item["id"],
+            exploration_run_id,
+            source_generated_script_id,
+            version,
+            "draft",
+            relative_spec,
+            content,
+            content_hash(content),
+            normalize_asset_mode(asset_mode),
+            json_case_ids(case_ids),
+            "",
+            timestamp,
+            timestamp,
+        ),
+    )
+    return version_id
+
+
+def update_script_version_run(conn: sqlite3.Connection, script_version_id: str, run_id: str, status: str) -> None:
+    next_status = "verified" if status == "passed" else "failed"
+    conn.execute(
+        """
+        UPDATE test_script_versions
+        SET status = ?, verified_run_id = ?, updated_at = ?
+        WHERE id = ? AND status != 'active'
+        """,
+        (next_status, run_id, now_iso(), script_version_id),
+    )
+
+
+def case_title_mapping_for_script(cases_markdown: str, script: str) -> dict[str, str]:
+    titles = extract_playwright_test_titles(script)
+    mapping: dict[str, str] = {}
+    for item in parse_cases_markdown(cases_markdown):
+        external_id = item["external_id"]
+        mapping[external_id] = next((title for title in titles if external_id in title), external_id)
+    return mapping
+
+
+def publish_script_version(
+    conn: sqlite3.Connection,
+    item: sqlite3.Row,
+    script_version_id: str,
+    case_ids: list[str],
+    cases_markdown: str,
+    script: str,
+    run: sqlite3.Row,
+    *,
+    source: str = "published",
+) -> str:
+    version_row = conn.execute("SELECT * FROM test_script_versions WHERE id = ?", (script_version_id,)).fetchone()
+    if version_row is None:
+        raise HTTPException(status_code=404, detail="脚本版本不存在")
+    if version_row["work_item_id"] != item["id"]:
+        raise HTTPException(status_code=400, detail="脚本版本不属于当前工单")
+    if run["status"] != "passed":
+        raise HTTPException(status_code=400, detail="草稿脚本验证失败，不能发布替换绑定")
+    project_id = item["project_id"] or ""
+    if not project_id:
+        raise HTTPException(status_code=400, detail="工单未绑定项目，请先选择项目")
+    normalized_case_ids = validate_case_ids_for_project(conn, project_id, normalize_case_ids(case_ids))
+    if not normalized_case_ids:
+        normalized_case_ids = sync_test_cases_from_markdown(
+            conn,
+            project_id,
+            item["id"],
+            cases_markdown,
+            "",
+            default_feature_id=item["feature_id"] if "feature_id" in item.keys() else "",
+            asset_mode=version_row["asset_mode"] or "create",
+            case_ids=[],
+        )
+    title_mapping = case_title_mapping_for_script(cases_markdown, script)
+    relative_spec = version_row["spec_path"]
+    timestamp = now_iso()
+    placeholders = ",".join("?" for _ in normalized_case_ids)
+    previous_version_ids = [
+        row["script_version_id"]
+        for row in conn.execute(
+            f"SELECT DISTINCT script_version_id FROM test_case_script_bindings WHERE case_id IN ({placeholders}) AND is_active = 1",
+            normalized_case_ids,
+        ).fetchall()
+    ]
+    conn.execute(
+        f"UPDATE test_case_script_bindings SET is_active = 0 WHERE case_id IN ({placeholders}) AND is_active = 1",
+        normalized_case_ids,
+    )
+    for previous_version_id in previous_version_ids:
+        still_active = conn.execute(
+            "SELECT 1 FROM test_case_script_bindings WHERE script_version_id = ? AND is_active = 1 LIMIT 1",
+            (previous_version_id,),
+        ).fetchone()
+        if still_active is None:
+            conn.execute(
+                "UPDATE test_script_versions SET status = 'archived', updated_at = ? WHERE id = ?",
+                (timestamp, previous_version_id),
+            )
+    conn.execute(
+        """
+        UPDATE test_script_versions
+        SET status = 'active', verified_run_id = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (run["id"], timestamp, script_version_id),
+    )
+    for case_id in normalized_case_ids:
+        case_row = conn.execute("SELECT * FROM test_cases WHERE id = ?", (case_id,)).fetchone()
+        if case_row is None:
+            continue
+        test_title = title_mapping.get(case_row["external_id"], case_row["external_id"])
+        conn.execute(
+            """
+            INSERT INTO test_case_script_bindings (
+                id, case_id, script_version_id, external_id, test_title,
+                grep_pattern, is_active, bound_by_source, bound_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                uuid.uuid4().hex[:12],
+                case_id,
+                script_version_id,
+                case_row["external_id"],
+                test_title,
+                re.escape(case_row["external_id"]),
+                1,
+                source,
+                timestamp,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE test_cases
+            SET automation_status = 'automated', spec_path = ?, latest_run_id = ?,
+                latest_status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (relative_spec, run["id"], run["status"], timestamp, case_id),
+        )
+    return relative_spec
+
+
 def row_to_test_case(row: sqlite3.Row) -> dict[str, Any]:
     with get_db() as conn:
         feature = feature_summary(conn, row["feature_id"])
+        active_binding = active_script_binding_for_case(conn, row["id"])
     return {
         "id": row["id"],
         "projectId": row["project_id"],
@@ -1583,11 +2535,36 @@ def row_to_test_case(row: sqlite3.Row) -> dict[str, Any]:
         "automationNotes": row["automation_notes"],
         "automationStatus": row["automation_status"],
         "specPath": row["spec_path"],
+        "scriptVersionId": active_binding.get("scriptVersionId", ""),
+        "scriptVersion": active_binding.get("version"),
+        "scriptStatus": active_binding.get("status", ""),
+        "testTitle": active_binding.get("testTitle", ""),
+        "grepPattern": active_binding.get("grepPattern", ""),
         "latestRunId": row["latest_run_id"],
         "latestStatus": row["latest_status"],
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
     }
+
+
+def delete_test_case_rows(conn: sqlite3.Connection, case_ids: list[str]) -> int:
+    unique_case_ids = list(dict.fromkeys(case_id.strip() for case_id in case_ids if case_id.strip()))
+    if not unique_case_ids:
+        raise HTTPException(status_code=400, detail="请选择至少一个用例删除")
+    placeholders = ",".join("?" for _ in unique_case_ids)
+    existing_case_ids = {
+        row["id"]
+        for row in conn.execute(
+            f"SELECT id FROM test_cases WHERE id IN ({placeholders})",
+            unique_case_ids,
+        ).fetchall()
+    }
+    missing_case_ids = [case_id for case_id in unique_case_ids if case_id not in existing_case_ids]
+    if missing_case_ids:
+        raise HTTPException(status_code=404, detail=f"存在无效用例：{', '.join(missing_case_ids)}")
+    conn.execute(f"DELETE FROM test_suite_cases WHERE case_id IN ({placeholders})", unique_case_ids)
+    conn.execute(f"DELETE FROM test_cases WHERE id IN ({placeholders})", unique_case_ids)
+    return len(unique_case_ids)
 
 
 def summarize_content(content: str, fallback: str = "") -> str:
@@ -1937,6 +2914,11 @@ def row_to_delivery_report_item(conn: sqlite3.Connection, case_row: sqlite3.Row)
     deliverable_summary: dict[str, Any] = {}
     for deliverable in deliverables_payload:
         deliverable_summary.setdefault(deliverable["type"], deliverable)
+    missing_types = [deliverable_type for deliverable_type in REQUIRED_DELIVERY_TYPES if deliverable_type not in deliverable_summary]
+    latest_status = case_row["latest_status"] or (run_row["status"] if run_row is not None else "")
+    readiness = "missing" if missing_types else "ready"
+    if latest_status == "failed":
+        readiness = "risk"
     updated_candidates = [case_row["updated_at"]]
     updated_candidates.extend(row["updated_at"] for row in deliverable_rows if row["updated_at"])
     updated_at = max(updated_candidates) if updated_candidates else case_row["updated_at"]
@@ -1947,15 +2929,109 @@ def row_to_delivery_report_item(conn: sqlite3.Connection, case_row: sqlite3.Row)
         "latestRun": row_to_run(run_row) if run_row else None,
         "deliverables": deliverables_payload,
         "deliverableSummary": deliverable_summary,
+        "readiness": readiness,
+        "missingTypes": missing_types,
         "updatedAt": updated_at,
     }
 
 
+def delivery_report_readiness_sql() -> tuple[str, str, str]:
+    missing_checks = [
+        f"""
+        NOT EXISTS (
+            SELECT 1 FROM deliverables d_{deliverable_type.replace("-", "_")}
+            WHERE {deliverable_case_match_sql(f"d_{deliverable_type.replace('-', '_')}")}
+              AND d_{deliverable_type.replace("-", "_")}.type = '{deliverable_type}'
+        )
+        """
+        for deliverable_type in REQUIRED_DELIVERY_TYPES
+    ]
+    missing_sql = " OR ".join(missing_checks)
+    failed_sql = """
+        COALESCE(
+            tc.latest_status,
+            (
+                SELECT r.status
+                FROM runs r
+                WHERE r.id = tc.latest_run_id
+                LIMIT 1
+            ),
+            (
+                SELECT wr.status
+                FROM runs wr
+                WHERE wr.work_item_id = tc.work_item_id
+                ORDER BY wr.started_at DESC
+                LIMIT 1
+            ),
+            ''
+        ) = 'failed'
+    """
+    readiness_sql = f"""
+        CASE
+            WHEN {failed_sql} THEN 'risk'
+            WHEN {missing_sql} THEN 'missing'
+            ELSE 'ready'
+        END
+    """
+    return readiness_sql, missing_sql, failed_sql
+
+
+def delivery_report_summary(conn: sqlite3.Connection, where_sql: str, params: list[Any]) -> dict[str, Any]:
+    readiness_sql, missing_sql, failed_sql = delivery_report_readiness_sql()
+    row = conn.execute(
+        f"""
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN ({readiness_sql}) = 'ready' THEN 1 ELSE 0 END) AS ready,
+            SUM(CASE WHEN ({missing_sql}) THEN 1 ELSE 0 END) AS missing,
+            SUM(CASE WHEN ({failed_sql}) THEN 1 ELSE 0 END) AS failed_risk
+        FROM test_cases tc
+        {where_sql}
+        """,
+        params,
+    ).fetchone()
+    missing_by_type: dict[str, int] = {}
+    for deliverable_type in REQUIRED_DELIVERY_TYPES:
+        alias = "dm"
+        missing_by_type[deliverable_type] = conn.execute(
+            f"""
+            SELECT COUNT(*) AS total
+            FROM test_cases tc
+            {where_sql}
+            AND NOT EXISTS (
+                SELECT 1 FROM deliverables {alias}
+                WHERE {deliverable_case_match_sql(alias)}
+                  AND {alias}.type = ?
+            )
+            """ if where_sql else f"""
+            SELECT COUNT(*) AS total
+            FROM test_cases tc
+            WHERE NOT EXISTS (
+                SELECT 1 FROM deliverables {alias}
+                WHERE {deliverable_case_match_sql(alias)}
+                  AND {alias}.type = ?
+            )
+            """,
+            [*params, deliverable_type],
+        ).fetchone()["total"]
+    return {
+        "total": row["total"] or 0,
+        "ready": row["ready"] or 0,
+        "missing": row["missing"] or 0,
+        "failedRisk": row["failed_risk"] or 0,
+        "missingByType": missing_by_type,
+    }
+
+
 def migrate_project_case_deliverable_data(conn: sqlite3.Connection) -> None:
-    project_id = ensure_default_project(conn)
-    conn.execute("UPDATE work_items SET project_id = ? WHERE project_id IS NULL OR project_id = ''", (project_id,))
+    default_project = conn.execute("SELECT id FROM projects WHERE id = ?", (DEFAULT_PROJECT_ID,)).fetchone()
+    if default_project is None:
+        return
+    legacy_project_id = default_project["id"]
+    conn.execute("UPDATE work_items SET project_id = ? WHERE project_id IS NULL OR project_id = ''", (legacy_project_id,))
     rows = conn.execute("SELECT * FROM work_items").fetchall()
     for row in rows:
+        project_id = row["project_id"] if "project_id" in row.keys() and row["project_id"] else legacy_project_id
         cases_path = row["cases_path"] if "cases_path" in row.keys() else ""
         spec_path = row["spec_path"] if "spec_path" in row.keys() else ""
         report_path = row["report_path"] if "report_path" in row.keys() else ""
@@ -1969,7 +3045,14 @@ def migrate_project_case_deliverable_data(conn: sqlite3.Connection) -> None:
                 (row["id"],),
             ).fetchone()
             cases_content = latest["content"] if latest else ""
-        case_ids = sync_test_cases_from_markdown(conn, project_id, row["id"], cases_content, relative_or_absolute(spec_path) if spec_path else "") if cases_content else []
+        case_ids = sync_test_cases_from_markdown(
+            conn,
+            project_id,
+            row["id"],
+            cases_content,
+            relative_or_absolute(spec_path) if spec_path else "",
+            asset_mode="append",
+        ) if cases_content else []
         for deliverable_type, path_value, name in [
             ("test-cases", cases_path, f"{row['title']} 测试用例"),
             ("spec", spec_path, f"{row['title']} 自动化脚本"),
@@ -1996,10 +3079,10 @@ def migrate_project_case_deliverable_data(conn: sqlite3.Connection) -> None:
                 content = case_path.read_text(encoding="utf-8")
                 sibling_spec_path = spec_path_for_case_doc(case_path)
                 sibling_spec = relative_or_absolute(sibling_spec_path) if sibling_spec_path.exists() else ""
-                case_ids = sync_test_cases_from_markdown(conn, project_id, "", content, sibling_spec)
+                case_ids = sync_test_cases_from_markdown(conn, legacy_project_id, "", content, sibling_spec, asset_mode="append")
                 register_deliverable(
                     conn,
-                    project_id,
+                    legacy_project_id,
                     "test-cases",
                     case_path.name,
                     case_path,
@@ -2011,7 +3094,7 @@ def migrate_project_case_deliverable_data(conn: sqlite3.Connection) -> None:
                     for case_id in case_ids:
                         register_deliverable(
                             conn,
-                            project_id,
+                            legacy_project_id,
                             "spec",
                             sibling_spec_path.name,
                             sibling_spec_path,
@@ -2022,7 +3105,7 @@ def migrate_project_case_deliverable_data(conn: sqlite3.Connection) -> None:
         for spec_path in test_dir.glob("*.spec.ts"):
             register_deliverable(
                 conn,
-                project_id,
+                legacy_project_id,
                 "spec",
                 spec_path.name,
                 spec_path,
@@ -2032,7 +3115,7 @@ def migrate_project_case_deliverable_data(conn: sqlite3.Connection) -> None:
     for report_path in ROOT_DIR.glob("*-test-report.md"):
         register_deliverable(
             conn,
-            project_id,
+            legacy_project_id,
             "manual-report",
             report_path.name,
             report_path,
@@ -2042,7 +3125,7 @@ def migrate_project_case_deliverable_data(conn: sqlite3.Connection) -> None:
     if REPORT_INDEX.exists():
         register_deliverable(
             conn,
-            project_id,
+            legacy_project_id,
             "html-report",
             "Playwright HTML Report",
             REPORT_INDEX,
@@ -2070,6 +3153,17 @@ def set_setting(key: str, value: str) -> None:
 
 
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+AI_PROFILES_SETTING_KEY = "ai_profiles"
+AI_ACTIVE_PROFILE_SETTING_KEY = "ai_active_profile_id"
+AI_PROVIDER_VALUES = {"openai", "gpt", "anthropic", "deepseek", "custom"}
+
+
+def mask_secret(value: str) -> str:
+    secret = (value or "").strip()
+    if not secret:
+        return ""
+    return f"{secret[:7]}...{secret[-4:]}" if len(secret) > 12 else "已配置"
 
 
 def normalize_openai_base_url(value: str) -> str:
@@ -2079,6 +3173,8 @@ def normalize_openai_base_url(value: str) -> str:
     base_url = base_url.rstrip("/")
     if base_url.endswith("/responses"):
         base_url = base_url[: -len("/responses")].rstrip("/")
+    if base_url.endswith("/chat/completions"):
+        base_url = base_url[: -len("/chat/completions")].rstrip("/")
     return base_url or DEFAULT_OPENAI_BASE_URL
 
 
@@ -2087,18 +3183,130 @@ def validate_openai_base_url(base_url: str) -> None:
         raise HTTPException(status_code=400, detail="Base URL 必须以 http:// 或 https:// 开头")
 
 
+def normalize_ai_provider(value: str) -> str:
+    provider = (value or "openai").strip().lower()
+    return provider if provider in AI_PROVIDER_VALUES else "custom"
+
+
+def default_ai_profile_name(provider: str) -> str:
+    return {
+        "openai": "OpenAI 默认配置",
+        "gpt": "GPT 网关配置",
+        "anthropic": "Anthropic 兼容配置",
+        "deepseek": "DeepSeek 配置",
+        "custom": "自定义 AI 配置",
+    }.get(provider, "AI 配置")
+
+
+def normalize_ai_profile(raw: dict[str, Any] | None, *, fallback_id: str = "") -> dict[str, str]:
+    payload = raw or {}
+    provider = normalize_ai_provider(str(payload.get("provider") or "openai"))
+    profile_id = str(payload.get("id") or fallback_id or uuid.uuid4().hex[:12]).strip()
+    name = str(payload.get("name") or default_ai_profile_name(provider)).strip() or default_ai_profile_name(provider)
+    model = str(payload.get("model") or DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
+    base_url = normalize_openai_base_url(str(payload.get("base_url") or payload.get("baseUrl") or DEFAULT_OPENAI_BASE_URL))
+    return {
+        "id": profile_id,
+        "name": name,
+        "provider": provider,
+        "api_key": str(payload.get("api_key") or payload.get("apiKey") or "").strip(),
+        "model": model,
+        "base_url": base_url,
+        "updated_at": str(payload.get("updated_at") or payload.get("updatedAt") or now_iso()),
+    }
+
+
+def public_ai_profile(profile: dict[str, str]) -> dict[str, Any]:
+    return {
+        "id": profile["id"],
+        "name": profile["name"],
+        "provider": profile["provider"],
+        "model": profile["model"],
+        "baseUrl": profile["base_url"],
+        "maskedKey": mask_secret(profile.get("api_key", "")),
+        "updatedAt": profile.get("updated_at", ""),
+    }
+
+
+def save_ai_profiles(profiles: list[dict[str, str]], active_profile_id: str = "") -> None:
+    normalized = [normalize_ai_profile(profile) for profile in profiles]
+    set_setting(AI_PROFILES_SETTING_KEY, json.dumps(normalized, ensure_ascii=False))
+    if active_profile_id:
+        set_setting(AI_ACTIVE_PROFILE_SETTING_KEY, active_profile_id)
+
+
+def legacy_ai_profile() -> dict[str, str] | None:
+    legacy_key = get_setting("openai_api_key")
+    legacy_model = get_setting("openai_model")
+    legacy_base_url = get_setting("openai_base_url")
+    if not any([legacy_key, legacy_model, legacy_base_url]):
+        return None
+    return normalize_ai_profile(
+        {
+            "id": "openai-default",
+            "name": "OpenAI 默认配置",
+            "provider": "openai",
+            "api_key": legacy_key,
+            "model": legacy_model or DEFAULT_OPENAI_MODEL,
+            "base_url": legacy_base_url or DEFAULT_OPENAI_BASE_URL,
+        }
+    )
+
+
+def get_ai_profiles(*, migrate_legacy: bool = True) -> list[dict[str, str]]:
+    stored = get_setting(AI_PROFILES_SETTING_KEY)
+    profiles: list[dict[str, str]] = []
+    if stored:
+        try:
+            decoded = json.loads(stored)
+        except json.JSONDecodeError:
+            decoded = []
+        if isinstance(decoded, list):
+            profiles = [normalize_ai_profile(item) for item in decoded if isinstance(item, dict)]
+    if not profiles and migrate_legacy:
+        legacy = legacy_ai_profile()
+        if legacy:
+            profiles = [legacy]
+            save_ai_profiles(profiles, legacy["id"])
+    return profiles
+
+
+def get_active_ai_profile(profiles: list[dict[str, str]] | None = None) -> dict[str, str] | None:
+    items = profiles if profiles is not None else get_ai_profiles()
+    if not items:
+        return None
+    active_id = get_setting(AI_ACTIVE_PROFILE_SETTING_KEY)
+    return next((profile for profile in items if profile["id"] == active_id), None) or items[0]
+
+
+def ai_runtime_config() -> dict[str, str]:
+    profile = get_active_ai_profile()
+    env_key = os.environ.get("OPENAI_API_KEY", "")
+    env_base_url = os.environ.get("OPENAI_BASE_URL", "")
+    base_url = env_base_url or (profile["base_url"] if profile else DEFAULT_OPENAI_BASE_URL)
+    return {
+        "profile_id": profile["id"] if profile else "",
+        "provider": profile["provider"] if profile else "not-configured",
+        "api_key": env_key or (profile["api_key"] if profile else ""),
+        "model": profile["model"] if profile else DEFAULT_OPENAI_MODEL,
+        "base_url": normalize_openai_base_url(base_url),
+        "source": "env" if env_key else "local" if profile and profile.get("api_key") else "none",
+        "base_url_source": "env" if env_base_url else "local" if profile and profile.get("base_url") else "default",
+    }
+
+
 def get_openai_api_key() -> str:
     if os.environ.get("QA_DISABLE_AI") == "1":
         return ""
-    return os.environ.get("OPENAI_API_KEY") or get_setting("openai_api_key")
+    return ai_runtime_config()["api_key"]
 
 
 def get_openai_model() -> str:
-    return get_setting("openai_model") or "gpt-4.1-mini"
+    return ai_runtime_config()["model"]
 
 
 def get_openai_base_url() -> str:
-    return normalize_openai_base_url(os.environ.get("OPENAI_BASE_URL") or get_setting("openai_base_url"))
+    return ai_runtime_config()["base_url"]
 
 
 def build_openai_url(path: str, base_url: str | None = None) -> str:
@@ -2106,7 +3314,33 @@ def build_openai_url(path: str, base_url: str | None = None) -> str:
     return f"{normalized_base}/{path.lstrip('/')}"
 
 
+def infer_ai_provider(provider: str = "", base_url: str = "") -> str:
+    normalized = normalize_ai_provider(provider or ai_runtime_config()["provider"])
+    hostname = urllib.parse.urlparse(base_url or "").hostname or ""
+    if normalized == "custom" and "deepseek.com" in hostname:
+        return "deepseek"
+    return normalized
+
+
+def build_chat_completions_url(base_url: str) -> str:
+    normalized_base = normalize_openai_base_url(base_url)
+    parsed = urllib.parse.urlparse(normalized_base)
+    if parsed.hostname == "api.deepseek.com" and parsed.path.rstrip("/") == "/v1":
+        normalized_base = normalized_base[: -len("/v1")]
+    return f"{normalized_base}/chat/completions"
+
+
 def parse_openai_text_response(body: dict[str, Any]) -> str:
+    if body.get("choices"):
+        text_chunks: list[str] = []
+        for choice in body.get("choices", []):
+            message = choice.get("message") or {}
+            if message.get("content"):
+                text_chunks.append(str(message["content"]))
+            elif choice.get("text"):
+                text_chunks.append(str(choice["text"]))
+        if text_chunks:
+            return "\n".join(text_chunks)
     text_chunks: list[str] = []
     for item_payload in body.get("output", []):
         for content in item_payload.get("content", []):
@@ -2131,7 +3365,7 @@ def openai_error_message(exc: Exception) -> str:
         status_messages = {
             401: "鉴权失败，请检查 API Key",
             403: "请求被拒绝，请检查 API Key 权限或网关访问策略",
-            404: "接口不存在，请确认 Base URL 支持 /responses",
+            404: "接口不存在，请确认 Base URL 支持当前厂商的生成接口",
             429: "请求被限流，请稍后重试或检查额度",
         }
         prefix = status_messages.get(exc.code, f"服务返回 HTTP {exc.code}")
@@ -2146,7 +3380,45 @@ def openai_error_message(exc: Exception) -> str:
     return str(exc) or "连接测试失败"
 
 
-def call_openai_responses(api_key: str, model: str, base_url: str, payload: dict[str, Any], timeout: int = 6) -> dict[str, Any]:
+def chat_payload_from_responses_payload(model: str, payload: dict[str, Any], *, stream: bool = False) -> dict[str, Any]:
+    input_value = payload.get("input", "")
+    if isinstance(input_value, list):
+        messages = input_value
+    else:
+        messages = [{"role": "user", "content": str(input_value)}]
+    chat_payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+    }
+    if payload.get("max_output_tokens") is not None:
+        chat_payload["max_tokens"] = payload["max_output_tokens"]
+    text_format = ((payload.get("text") or {}).get("format") or {}) if isinstance(payload.get("text"), dict) else {}
+    if text_format:
+        chat_payload["response_format"] = {"type": "json_object"}
+    return chat_payload
+
+
+def call_openai_chat_completions(api_key: str, model: str, base_url: str, payload: dict[str, Any], timeout: int = 6) -> dict[str, Any]:
+    url = build_chat_completions_url(base_url)
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(chat_payload_from_responses_payload(model, payload)).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    hostname = urllib.parse.urlparse(url).hostname or ""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({})) if hostname in {"localhost", "127.0.0.1", "::1"} else urllib.request.build_opener()
+    with opener.open(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def call_openai_responses(api_key: str, model: str, base_url: str, payload: dict[str, Any], timeout: int = 6, provider: str = "") -> dict[str, Any]:
+    if infer_ai_provider(provider, base_url) == "deepseek":
+        return call_openai_chat_completions(api_key, model, base_url, payload, timeout=timeout)
     url = build_openai_url("/responses", base_url)
     request = urllib.request.Request(
         url,
@@ -2164,6 +3436,16 @@ def call_openai_responses(api_key: str, model: str, base_url: str, payload: dict
 
 
 def extract_openai_stream_delta(event: dict[str, Any]) -> str:
+    if event.get("choices"):
+        chunks: list[str] = []
+        for choice in event.get("choices", []):
+            delta = choice.get("delta") or {}
+            if delta.get("content"):
+                chunks.append(str(delta["content"]))
+            elif choice.get("message", {}).get("content"):
+                chunks.append(str(choice["message"]["content"]))
+        if chunks:
+            return "".join(chunks)
     event_type = str(event.get("type") or "")
     if event_type in {"response.output_text.delta", "response.refusal.delta"}:
         return str(event.get("delta") or "")
@@ -2186,7 +3468,10 @@ def call_openai_responses_stream(
     payload: dict[str, Any],
     artifact_id: str,
     timeout: int = 24,
+    provider: str = "",
 ) -> str:
+    if infer_ai_provider(provider, base_url) == "deepseek":
+        return call_openai_chat_completions_stream(api_key, model, base_url, payload, artifact_id, timeout=timeout)
     url = build_openai_url("/responses", base_url)
     stream_payload = {**payload, "model": model, "stream": True}
     request = urllib.request.Request(
@@ -2237,32 +3522,91 @@ def call_openai_responses_stream(
     return text if not seen_output_item_done else text.strip()
 
 
+def call_openai_chat_completions_stream(
+    api_key: str,
+    model: str,
+    base_url: str,
+    payload: dict[str, Any],
+    artifact_id: str,
+    timeout: int = 24,
+) -> str:
+    url = build_chat_completions_url(base_url)
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(chat_payload_from_responses_payload(model, payload, stream=True)).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        },
+        method="POST",
+    )
+    hostname = urllib.parse.urlparse(url).hostname or ""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({})) if hostname in {"localhost", "127.0.0.1", "::1"} else urllib.request.build_opener()
+    chunks: list[str] = []
+    with opener.open(request, timeout=timeout) as response:
+        event_lines: list[str] = []
+        while True:
+            raw = response.readline()
+            if not raw:
+                break
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not line:
+                data_lines = [item[5:].strip() for item in event_lines if item.startswith("data:")]
+                event_lines = []
+                if not data_lines:
+                    continue
+                data = "\n".join(data_lines)
+                if data == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                delta = extract_openai_stream_delta(event)
+                if not delta:
+                    continue
+                chunks.append(delta)
+                append_flow_artifact_content(artifact_id, delta)
+                continue
+            event_lines.append(line)
+    return "".join(chunks).strip()
+
+
 def current_ai_status() -> dict[str, Any]:
+    profiles = get_ai_profiles()
+    active_profile = get_active_ai_profile(profiles)
+    runtime = ai_runtime_config()
     if os.environ.get("QA_DISABLE_AI") == "1":
         return {
             "configured": False,
             "provider": "disabled-for-test",
             "source": "disabled",
-            "model": get_openai_model(),
-            "baseUrl": get_openai_base_url(),
+            "model": runtime["model"],
+            "baseUrl": runtime["base_url"],
             "baseUrlSource": "disabled",
             "baseUrlLocked": False,
+            "profileId": active_profile["id"] if active_profile else "",
+            "activeProfileId": active_profile["id"] if active_profile else "",
+            "activeProfile": public_ai_profile(active_profile) if active_profile else None,
+            "profiles": [public_ai_profile(profile) for profile in profiles],
         }
-    env_key = os.environ.get("OPENAI_API_KEY")
-    local_key = get_setting("openai_api_key")
-    source = "env" if env_key else "local" if local_key else "none"
-    configured = source != "none"
-    env_base_url = os.environ.get("OPENAI_BASE_URL")
-    local_base_url = get_setting("openai_base_url")
-    base_url_source = "env" if env_base_url else "local" if local_base_url else "default"
+    env_key = os.environ.get("OPENAI_API_KEY", "")
+    configured = bool(runtime["api_key"])
     return {
         "configured": configured,
-        "provider": "openai" if configured else "not-configured",
-        "source": source,
-        "model": get_openai_model(),
-        "baseUrl": get_openai_base_url(),
-        "baseUrlSource": base_url_source,
-        "baseUrlLocked": bool(env_base_url),
+        "provider": runtime["provider"] if configured or active_profile else "not-configured",
+        "source": runtime["source"],
+        "model": runtime["model"],
+        "baseUrl": runtime["base_url"],
+        "baseUrlSource": runtime["base_url_source"],
+        "baseUrlLocked": bool(os.environ.get("OPENAI_BASE_URL")),
+        "profileId": active_profile["id"] if active_profile else "",
+        "activeProfileId": active_profile["id"] if active_profile else "",
+        "activeProfile": public_ai_profile(active_profile) if active_profile else None,
+        "profiles": [public_ai_profile(profile) for profile in profiles],
+        "maskedKey": mask_secret(env_key or (active_profile.get("api_key", "") if active_profile else "")),
+        "envLocked": bool(env_key),
     }
 
 
@@ -2566,13 +3910,16 @@ def requirement_analysis(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def row_to_work_item(row: sqlite3.Row, include_detail: bool = False) -> dict[str, Any]:
-    project_id = row["project_id"] if "project_id" in row.keys() and row["project_id"] else DEFAULT_PROJECT_ID
+    project_id = row["project_id"] if "project_id" in row.keys() and row["project_id"] else ""
     with get_db() as conn:
         feature = feature_summary(conn, row["feature_id"] if "feature_id" in row.keys() else "")
+        case_ids = safe_json_loads(row["case_ids_json"] if "case_ids_json" in row.keys() else "", [])
     payload = {
         "id": row["id"],
         "projectId": project_id,
         **feature,
+        "assetMode": row["asset_mode"] if "asset_mode" in row.keys() and row["asset_mode"] else "create",
+        "caseIds": normalize_case_ids(case_ids if isinstance(case_ids, list) else []),
         "slug": row["slug"],
         "title": row["title"],
         "requirement": row["requirement"],
@@ -3020,6 +4367,45 @@ def update_suite_run(suite_run_id: str, **fields: Any) -> None:
         conn.execute(f"UPDATE suite_runs SET {keys} WHERE id = ?", [*fields.values(), suite_run_id])
 
 
+async def merge_suite_html_report(suite_run_id: str) -> Path | None:
+    blob_dir = suite_blob_report_dir(suite_run_id)
+    html_report = suite_html_report_index(suite_run_id)
+    blob_files = sorted(blob_dir.glob("*.zip")) if blob_dir.exists() else []
+    if not blob_files:
+        return None
+
+    html_report.parent.mkdir(parents=True, exist_ok=True)
+    process = await asyncio.create_subprocess_exec(
+        "npx",
+        "playwright",
+        "merge-reports",
+        str(blob_dir),
+        "--reporter=html",
+        cwd=ROOT_DIR,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env={
+            **os.environ,
+            "PLAYWRIGHT_HTML_OUTPUT_DIR": str(html_report.parent),
+            "PLAYWRIGHT_HTML_OPEN": "never",
+        },
+        limit=BROWSER_WORKER_STREAM_LIMIT_BYTES,
+    )
+    assert process.stdout is not None
+    output_lines: list[str] = []
+    while True:
+        raw = await process.stdout.readline()
+        if not raw:
+            break
+        line = raw.decode(errors="replace").rstrip()
+        if line:
+            output_lines.append(line)
+    exit_code = await process.wait()
+    if exit_code != 0:
+        raise RuntimeError("\n".join(output_lines) or f"merge-reports exited with {exit_code}")
+    return html_report if html_report.exists() else None
+
+
 def refresh_suite_run_counts(suite_run_id: str) -> None:
     with get_db() as conn:
         rows = conn.execute(
@@ -3369,6 +4755,51 @@ def default_cases(item: sqlite3.Row) -> str:
 """
 
 
+PLAYWRIGHT_VERBOSE_STEP_HELPER = """async function runStep<T>(title: string, action: () => Promise<T>): Promise<T> {
+  console.log(`[步骤开始] ${title}`);
+  return await test.step(title, async () => {
+    try {
+      const result = await action();
+      console.log(`[步骤通过] ${title}`);
+      return result;
+    } catch (error) {
+      console.log(`[步骤失败] ${title}: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    }
+  });
+}
+"""
+
+PLAYWRIGHT_VERBOSE_TEST_HOOKS = """test.beforeEach(async ({}, testInfo) => {
+  console.log(`[步骤开始] 测试用例: ${testInfo.title}`);
+});
+
+test.afterEach(async ({}, testInfo) => {
+  if (testInfo.status === testInfo.expectedStatus) {
+    console.log(`[步骤通过] 测试用例: ${testInfo.title}`);
+  } else {
+    console.log(`[步骤失败] 测试用例: ${testInfo.title}，状态 ${testInfo.status}`);
+  }
+});
+"""
+
+
+def script_has_verbose_logging(script: str) -> bool:
+    markers = ["runStep(", "test.step(", "[步骤开始]"]
+    return any(marker in script for marker in markers)
+
+
+def ensure_verbose_playwright_logging(script: str) -> str:
+    if script_has_verbose_logging(script):
+        return script
+    import_block = re.match(r"((?:import[^\n]+;\s*\n)+)", script)
+    if not import_block:
+        return script
+    insert_at = import_block.end()
+    verbose_block = f"\n{PLAYWRIGHT_VERBOSE_STEP_HELPER}\n{PLAYWRIGHT_VERBOSE_TEST_HOOKS}\n"
+    return f"{script[:insert_at]}{verbose_block}{script[insert_at:]}"
+
+
 def default_script(item: sqlite3.Row, elements: list[sqlite3.Row]) -> str:
     title = item["title"].replace("'", "\\'")
     url = item["target_url"] or "/"
@@ -3390,6 +4821,8 @@ def default_script(item: sqlite3.Row, elements: list[sqlite3.Row]) -> str:
         }
         return f"""import {{ expect, test, type Page }} from '@playwright/test';
 
+{PLAYWRIGHT_VERBOSE_STEP_HELPER}
+
 const loginUrl = '{url}';
 const validUsername = '{username}';
 const validPassword = '{password}';
@@ -3408,49 +4841,61 @@ function loginButton(page: Page) {{
 }}
 
 async function gotoLoginPage(page: Page) {{
-  // 打开目标登录页，验证登录表单已经渲染。
-  await page.goto(loginUrl, {{ waitUntil: 'domcontentloaded', timeout: 30_000 }});
-  await expect(usernameInput(page)).toBeVisible({{ timeout: 15_000 }});
-  await expect(passwordInput(page)).toBeVisible({{ timeout: 15_000 }});
+  await runStep('打开目标登录页并验证登录表单', async () => {{
+    // 打开目标登录页，验证登录表单已经渲染。
+    await page.goto(loginUrl, {{ waitUntil: 'domcontentloaded', timeout: 30_000 }});
+    await expect(usernameInput(page)).toBeVisible({{ timeout: 15_000 }});
+    await expect(passwordInput(page)).toBeVisible({{ timeout: 15_000 }});
+  }});
 }}
 
 async function submitLogin(page: Page, username: string, password: string) {{
-  // 按场景填入账号密码并提交登录表单。
-  await usernameInput(page).fill(username);
-  await passwordInput(page).fill(password);
-  await expect(loginButton(page)).toBeEnabled({{ timeout: 10_000 }});
-  await loginButton(page).click();
+  await runStep(`填写账号 ${{username || '空'}} 并提交登录表单`, async () => {{
+    // 按场景填入账号密码并提交登录表单。
+    await usernameInput(page).fill(username);
+    await passwordInput(page).fill(password);
+    await expect(loginButton(page)).toBeEnabled({{ timeout: 10_000 }});
+    await loginButton(page).click();
+  }});
 }}
 
 async function expectLoggedIn(page: Page) {{
-  // 使用 ZZPSS 真实首页信号判定登录成功。
-  await page.waitForURL(/#\\/home$/, {{ timeout: 20_000 }});
-  await expect(page.getByText(`欢迎您，${{displayName}}`)).toBeVisible({{ timeout: 15_000 }});
-  await expect(page.locator('.menu-item.menu-active').filter({{ hasText: '首页' }})).toBeVisible({{ timeout: 15_000 }});
-  await expect(page.getByText('基本情况', {{ exact: true }}).first()).toBeVisible({{ timeout: 15_000 }});
+  await runStep('验证登录成功并进入首页', async () => {{
+    // 使用 ZZPSS 真实首页信号判定登录成功。
+    await page.waitForURL(/#\\/home$/, {{ timeout: 20_000 }});
+    await expect(page.getByText(`欢迎您，${{displayName}}`)).toBeVisible({{ timeout: 15_000 }});
+    await expect(page.locator('.menu-item.menu-active').filter({{ hasText: '首页' }})).toBeVisible({{ timeout: 15_000 }});
+    await expect(page.getByText('基本情况', {{ exact: true }}).first()).toBeVisible({{ timeout: 15_000 }});
+  }});
 }}
 
 async function expectStillOnLoginPage(page: Page) {{
-  // 验证异常输入不会进入首页。
-  await expect(page).toHaveURL(/#\\/login(?:\\?|$)/, {{ timeout: 10_000 }});
-  await expect(usernameInput(page)).toBeVisible({{ timeout: 10_000 }});
-  await expect(passwordInput(page)).toBeVisible({{ timeout: 10_000 }});
+  await runStep('验证异常输入仍停留在登录页', async () => {{
+    // 验证异常输入不会进入首页。
+    await expect(page).toHaveURL(/#\\/login(?:\\?|$)/, {{ timeout: 10_000 }});
+    await expect(usernameInput(page)).toBeVisible({{ timeout: 10_000 }});
+    await expect(passwordInput(page)).toBeVisible({{ timeout: 10_000 }});
+  }});
 }}
 
 async function expectUnauthenticated(page: Page) {{
-  // 验证未成功建立登录态。
-  await expect(page).not.toHaveURL(/#\\/home$/, {{ timeout: 5_000 }});
-  await expect(usernameInput(page)).toBeVisible({{ timeout: 10_000 }});
-  await expect(passwordInput(page)).toBeVisible({{ timeout: 10_000 }});
+  await runStep('验证未建立登录态', async () => {{
+    // 验证未成功建立登录态。
+    await expect(page).not.toHaveURL(/#\\/home$/, {{ timeout: 5_000 }});
+    await expect(usernameInput(page)).toBeVisible({{ timeout: 10_000 }});
+    await expect(passwordInput(page)).toBeVisible({{ timeout: 10_000 }});
+  }});
 }}
 
 async function expectValidationMessage(page: Page, pattern: RegExp) {{
-  // 捕获 Element Plus 表单校验或消息提示。
-  await expect(
-    page.locator('.el-form-item__error, .el-message, .el-message__content, .el-notification, .el-notification__content')
-      .or(page.getByText(pattern))
-      .first(),
-  ).toBeVisible({{ timeout: 10_000 }});
+  await runStep('验证页面展示登录失败或表单校验提示', async () => {{
+    // 捕获 Element Plus 表单校验或消息提示。
+    await expect(
+      page.locator('.el-form-item__error, .el-message, .el-message__content, .el-notification, .el-notification__content')
+        .or(page.getByText(pattern))
+        .first(),
+    ).toBeVisible({{ timeout: 10_000 }});
+  }});
 }}
 
 test.describe('{title}', () => {{
@@ -3506,7 +4951,9 @@ test.describe('{title}', () => {{
     await gotoLoginPage(page);
     await submitLogin(page, validUsername, validPassword);
     await expectLoggedIn(page);
-    await page.reload({{ waitUntil: 'domcontentloaded', timeout: 30_000 }});
+    await runStep('刷新页面验证登录态保持', async () => {{
+      await page.reload({{ waitUntil: 'domcontentloaded', timeout: 30_000 }});
+    }});
     await expectLoggedIn(page);
   }});
 
@@ -3515,45 +4962,61 @@ test.describe('{title}', () => {{
     await gotoLoginPage(page);
     await submitLogin(page, validUsername, validPassword);
     await expectLoggedIn(page);
-    await page.goto(loginUrl, {{ waitUntil: 'domcontentloaded', timeout: 30_000 }});
-    await expect(page.locator('body')).toBeVisible({{ timeout: 10_000 }});
-    await expect(page).not.toHaveURL(/about:blank/);
+    await runStep('已登录状态再次访问登录页', async () => {{
+      await page.goto(loginUrl, {{ waitUntil: 'domcontentloaded', timeout: 30_000 }});
+      await expect(page.locator('body')).toBeVisible({{ timeout: 10_000 }});
+      await expect(page).not.toHaveURL(/about:blank/);
+    }});
   }});
 
   test('{case_ids["availability"]} P2 登录页不可达或服务异常时给出可判定结果', async ({{ page }}) => {{
     // 目标服务正常时应渲染登录页；服务异常时 Playwright 会给出明确导航失败。
     await gotoLoginPage(page);
-    await expect(loginButton(page)).toBeVisible({{ timeout: 10_000 }});
+    await runStep('验证登录按钮可见', async () => {{
+      await expect(loginButton(page)).toBeVisible({{ timeout: 10_000 }});
+    }});
   }});
 }});
 """
     if "saucedemo" in url.lower() or "sauce demo" in item["title"].lower():
         return f"""import {{ expect, test }} from '@playwright/test';
 
+{PLAYWRIGHT_VERBOSE_STEP_HELPER}
+
 test.describe('{title}', () => {{
   test('TC-{item['slug'].upper()}-001 主流程满足验收标准', async ({{ page }}) => {{
-    // 打开需求指定目标页面，建立可重复的测试前置状态。
-    await page.goto('{url}');
+    await runStep('打开 Sauce Demo 登录页', async () => {{
+      // 打开需求指定目标页面，建立可重复的测试前置状态。
+      await page.goto('{url}');
+    }});
 
-    // 使用 Sauce Demo 稳定的 data-test selector 完成登录。
-    await page.locator('[data-test="username"]').fill('{username}');
-    await page.locator('[data-test="password"]').fill('{password}');
-    await page.locator('[data-test="login-button"]').click();
+    await runStep('使用稳定 selector 完成登录', async () => {{
+      // 使用 Sauce Demo 稳定的 data-test selector 完成登录。
+      await page.locator('[data-test="username"]').fill('{username}');
+      await page.locator('[data-test="password"]').fill('{password}');
+      await page.locator('[data-test="login-button"]').click();
+    }});
 
-    // 验证登录成功进入商品页。
-    await expect(page.locator('[data-test="title"]')).toHaveText('Products', {{ timeout: 10_000 }});
+    await runStep('验证登录成功进入商品页', async () => {{
+      // 验证登录成功进入商品页。
+      await expect(page.locator('[data-test="title"]')).toHaveText('Products', {{ timeout: 10_000 }});
+    }});
 
-    // 覆盖核心购物流程：添加指定商品并进入购物车。
-    await page.locator('[data-test="add-to-cart-sauce-labs-backpack"]').click();
-    await expect(page.locator('[data-test="shopping-cart-badge"]')).toHaveText('1');
-    await page.locator('[data-test="shopping-cart-link"]').click();
-    const cartItem = page.locator('[data-test="inventory-item"]').filter({{ hasText: '{product}' }});
-    await expect(cartItem.locator('[data-test="inventory-item-name"]')).toHaveText('{product}');
+    await runStep('添加指定商品并进入购物车', async () => {{
+      // 覆盖核心购物流程：添加指定商品并进入购物车。
+      await page.locator('[data-test="add-to-cart-sauce-labs-backpack"]').click();
+      await expect(page.locator('[data-test="shopping-cart-badge"]')).toHaveText('1');
+      await page.locator('[data-test="shopping-cart-link"]').click();
+      const cartItem = page.locator('[data-test="inventory-item"]').filter({{ hasText: '{product}' }});
+      await expect(cartItem.locator('[data-test="inventory-item-name"]')).toHaveText('{product}');
+    }});
 
-    // 触发低风险必填校验错误态，不提交订单。
-    await page.locator('[data-test="checkout"]').click();
-    await page.locator('[data-test="continue"]').click();
-    await expect(page.locator('[data-test="error"]')).toContainText('First Name is required');
+    await runStep('触发结账必填校验错误态', async () => {{
+      // 触发低风险必填校验错误态，不提交订单。
+      await page.locator('[data-test="checkout"]').click();
+      await page.locator('[data-test="continue"]').click();
+      await expect(page.locator('[data-test="error"]')).toContainText('First Name is required');
+    }});
   }});
 }});
 """
@@ -3574,13 +5037,19 @@ test.describe('{title}', () => {{
             locator_line = f"page.getByText('{value}')"
     return f"""import {{ expect, test }} from '@playwright/test';
 
+{PLAYWRIGHT_VERBOSE_STEP_HELPER}
+
 test.describe('{title}', () => {{
   test('TC-{item['slug'].upper()}-001 主流程满足验收标准', async ({{ page }}) => {{
-    // 打开需求指定目标页面，建立可重复的测试前置状态。
-    await page.goto('{url}');
+    await runStep('打开需求指定目标页面', async () => {{
+      // 打开需求指定目标页面，建立可重复的测试前置状态。
+      await page.goto('{url}');
+    }});
 
-    // 验证探索阶段确认的关键元素可见，证明页面已进入目标状态。
-    await expect({locator_line}).toBeVisible({{ timeout: 10_000 }});
+    await runStep('验证探索阶段确认的关键元素可见', async () => {{
+      // 验证探索阶段确认的关键元素可见，证明页面已进入目标状态。
+      await expect({locator_line}).toBeVisible({{ timeout: 10_000 }});
+    }});
   }});
 }});
 """ 
@@ -3678,7 +5147,7 @@ def ai_playwright_script(item: sqlite3.Row, elements: list[sqlite3.Row], cases_m
         content = parse_openai_text_response(body).strip()
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
         return ""
-    script = extract_playwright_script(content)
+    script = ensure_verbose_playwright_logging(extract_playwright_script(content))
     return script if valid_playwright_script(script, elements) else ""
 
 
@@ -3699,9 +5168,13 @@ ZZPSS 登录成功判定：
 要求：
 - 使用 import {{ expect, test }} from '@playwright/test';
 - 每个测试步骤都在相邻位置写中文注释。
+- 每个业务步骤必须使用 `await test.step('中文步骤名', async () => {{ ... }})` 包裹，并在步骤开始、成功、失败时分别打印 `console.log('[步骤开始] ...')`、`console.log('[步骤通过] ...')`、`console.log('[步骤失败] ...')`。
+- 不允许只写注释代替运行时日志；执行日志必须能逐步看到打开页面、输入、点击、断言、截图/证据等关键动作。
+- 可以定义 `runStep(title, action)` helper 统一封装 `console.log` 与 `test.step`，但每个关键动作都必须调用它。
 - locator 只能来自已确认元素、页面可见文案、ARIA role/name、label、placeholder、稳定 data-test/data-testid 或项目已有约定。
 - 使用 web-first assertions；不要使用固定 waitForTimeout。
 - 必要 timeout 必须有上限。
+返回完整 TypeScript spec，不要解释。
 {domain_guidance}
 
 标题：{item['title']}
@@ -3749,7 +5222,7 @@ def stream_ai_playwright_script_sync(item: sqlite3.Row, elements: list[sqlite3.R
         content = call_openai_responses_stream(api_key, get_openai_model(), get_openai_base_url(), payload, artifact_id, timeout=24).strip()
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
         return ""
-    script = extract_playwright_script(content)
+    script = ensure_verbose_playwright_logging(extract_playwright_script(content))
     if script != content:
         update_flow_artifact(artifact_id, content=script)
     return script if valid_playwright_script(script, elements) else ""
@@ -3826,7 +5299,7 @@ def ai_healed_script(item: sqlite3.Row, current_script: str, run: sqlite3.Row, f
         content = parse_openai_text_response(body).strip()
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
         return ""
-    script = extract_playwright_script(content)
+    script = ensure_verbose_playwright_logging(extract_playwright_script(content))
     return script if valid_playwright_script(script, elements) else ""
 
 
@@ -3840,6 +5313,8 @@ def healed_script_prompt(item: sqlite3.Row, current_script: str, run: sqlite3.Ro
 允许修改：测试数据、等待策略、selector、断言、Playwright 测试代码。
 禁止削弱核心验收断言来掩盖产品问题。返回完整 TypeScript spec，不要解释。
 如果 Playwright error-context 显示业务首页、欢迎语或目标成功状态已经出现，应优先用这些真实可见文本、URL 或稳定 CSS 作为断言，而不是继续等待不存在的通用 layout/navigation selector。
+必须保留或补齐详细步骤日志：每个业务步骤使用 test.step 或 runStep 包裹，并打印 `console.log('[步骤开始] ...')`、`console.log('[步骤通过] ...')`、失败时 `console.log('[步骤失败] ...')`。
+修复 selector、等待或断言时，不得删除现有 `test.step`、`runStep` 或 `console.log` 步骤日志；如果当前脚本缺少这些日志，返回的修复脚本必须补齐。
 
 需求：{item['requirement']}
 目标 URL：{item['target_url']}
@@ -3870,7 +5345,7 @@ def stream_ai_healed_script_sync(item: sqlite3.Row, current_script: str, run: sq
         content = call_openai_responses_stream(api_key, get_openai_model(), get_openai_base_url(), payload, artifact_id, timeout=30).strip()
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
         return ""
-    script = extract_playwright_script(content)
+    script = ensure_verbose_playwright_logging(extract_playwright_script(content))
     if script != content:
         update_flow_artifact(artifact_id, content=script)
     return script if valid_playwright_script(script, elements) else ""
@@ -5007,6 +6482,7 @@ def row_to_run(row: sqlite3.Row) -> dict[str, Any]:
         "screenshotPath": row["screenshot_path"],
         "workItemId": row["work_item_id"] if "work_item_id" in row.keys() else None,
         "browserSessionId": row["browser_session_id"] if "browser_session_id" in row.keys() else None,
+        "scriptVersionId": row["script_version_id"] if "script_version_id" in row.keys() else "",
         "browserSession": None,
     }
     if payload["browserSessionId"]:
@@ -5095,7 +6571,7 @@ def row_to_automation_flow_summary(row: sqlite3.Row) -> dict[str, Any]:
         work_item_row = conn.execute("SELECT * FROM work_items WHERE id = ?", (work_item_id,)).fetchone() if work_item_id else None
         project_id = ""
         if work_item_row is not None:
-            project_id = work_item_row["project_id"] if "project_id" in work_item_row.keys() and work_item_row["project_id"] else DEFAULT_PROJECT_ID
+            project_id = work_item_row["project_id"] if "project_id" in work_item_row.keys() and work_item_row["project_id"] else ""
             feature_id = work_item_row["feature_id"] if "feature_id" in work_item_row.keys() and work_item_row["feature_id"] else flow_feature_id
         else:
             feature_id = flow_feature_id
@@ -5265,17 +6741,15 @@ async def run_work_item_draft_once(work_item_id: str, flow_run_id: str = "") -> 
     if "test(" not in script or "expect(" not in script:
         raise HTTPException(status_code=400, detail="脚本基础校验失败：需要包含 test 和 expect")
     await wait_for_no_active_playwright_run()
-    relative_spec = write_draft_spec(item, script)
     with get_db() as conn:
-        for case_row in conn.execute("SELECT id FROM test_cases WHERE work_item_id = ?", (work_item_id,)).fetchall():
-            conn.execute(
-                """
-                UPDATE test_cases
-                SET spec_path = ?, automation_status = 'automated', updated_at = ?
-                WHERE id = ?
-                """,
-                (relative_spec, now_iso(), case_row["id"]),
-            )
+        asset_mode, case_ids = work_item_asset_defaults(conn, item)
+        version_row = latest_script_version_for_work_item(conn, work_item_id)
+        if version_row is None:
+            script_version_id = create_script_version(conn, item, script, asset_mode=asset_mode, case_ids=case_ids)
+            version_row = conn.execute("SELECT * FROM test_script_versions WHERE id = ?", (script_version_id,)).fetchone()
+        relative_spec = version_row["spec_path"]
+        resolve_workspace_path(relative_spec).write_text(version_row["content"], encoding="utf-8")
+        script_version_id = version_row["id"]
     suite = {
         "id": item["slug"],
         "name": item["title"],
@@ -5285,13 +6759,14 @@ async def run_work_item_draft_once(work_item_id: str, flow_run_id: str = "") -> 
         "description": item["requirement"],
     }
     run_id = uuid.uuid4().hex[:12]
+    html_report = run_html_report_index(run_id)
     with get_db() as conn:
         conn.execute(
             """
             INSERT INTO runs (
                 id, suite_id, suite_name, spec, status, stage_key, stage_label, progress,
-                started_at, report_path, screenshot_path, work_item_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                started_at, report_path, screenshot_path, work_item_id, script_version_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -5303,9 +6778,10 @@ async def run_work_item_draft_once(work_item_id: str, flow_run_id: str = "") -> 
                 "准备环境",
                 6,
                 now_iso(),
-                str(REPORT_INDEX),
+                relative_or_absolute(html_report),
                 str(SCREENSHOT_PATH),
                 work_item_id,
+                script_version_id,
             ),
         )
     update_work_item(work_item_id, stage="运行验证", status="running", latest_run_id=run_id)
@@ -5316,6 +6792,8 @@ async def run_work_item_draft_once(work_item_id: str, flow_run_id: str = "") -> 
     await run_playwright(run_id, suite, work_item_id)
     with get_db() as conn:
         row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row is not None:
+            update_script_version_run(conn, script_version_id, run_id, row["status"])
     if row is None:
         raise HTTPException(status_code=500, detail="Playwright 运行记录丢失")
     return row
@@ -5466,7 +6944,11 @@ async def execute_automation_flow(flow_run_id: str) -> None:
         else:
             cases_markdown = default_cases(item)
             update_flow_artifact(cases_artifact_id, content=cases_markdown, status="fallback", source="fallback")
-        generate_cases(item["id"], ContentRequest(content=cases_markdown))
+        original_cases_markdown = cases_markdown
+        generated_case_item = generate_cases(item["id"], ContentRequest(content=cases_markdown, asset_mode=flow_row["asset_mode"] if "asset_mode" in flow_row.keys() else "create"))
+        cases_markdown = generated_case_item.get("casesMarkdown") or cases_markdown
+        if cases_markdown != original_cases_markdown:
+            update_flow_artifact(cases_artifact_id, content=cases_markdown, status="ready")
         write_automation_flow_log(flow_run_id, "用例设计", "success", "已保存可追溯测试用例，包含 ID、优先级、覆盖需求、步骤和期望结果")
 
         set_flow_stage(flow_run_id, "页面探索", 38)
@@ -5552,7 +7034,8 @@ async def execute_automation_flow(flow_run_id: str) -> None:
         else:
             script_content = default_script(item, elements)
             update_flow_artifact(script_artifact_id, content=script_content, status="fallback", source="fallback")
-        generate_script(item["id"], ContentRequest(content=script_content))
+        generated_script_item = generate_script(item["id"], ContentRequest(content=script_content, asset_mode=flow_row["asset_mode"] if "asset_mode" in flow_row.keys() else "create"))
+        script_content = generated_script_item.get("scriptContent") or script_content
         write_automation_flow_log(flow_run_id, "脚本实现", "success", "已生成草稿 Playwright spec，关键 locator 来自已确认页面元素")
 
         set_flow_stage(flow_run_id, "运行验证", 68)
@@ -5618,6 +7101,7 @@ async def execute_automation_flow(flow_run_id: str) -> None:
                     source="ai" if get_openai_api_key() else "fallback",
                 )
                 healed_script = await stream_ai_healed_script(item, current_script, latest_run, failure_log, elements, healed_artifact_id)
+                healed_script = ensure_verbose_playwright_logging(healed_script) if healed_script else ""
                 if not script_changed_enough(current_script, healed_script, failure_log):
                     reason = "未生成有效修复脚本" if not healed_script else "修复脚本与上一轮无实质变化或仍包含本轮失败 locator"
                     write_automation_flow_log(flow_run_id, "自愈诊断", "warning", f"第 {attempt} 轮自愈无效：{reason}，停止重复重跑")
@@ -5642,9 +7126,26 @@ async def execute_automation_flow(flow_run_id: str) -> None:
                     break
                 update_flow_artifact(healed_artifact_id, content=healed_script, status="ready", source="ai")
                 with get_db() as conn:
+                    asset_mode, case_ids = work_item_asset_defaults(conn, item)
+                    healed_cursor = conn.execute(
+                        """
+                        INSERT INTO generated_scripts (work_item_id, content, asset_mode, case_ids_json, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (item["id"], healed_script, asset_mode, json_case_ids(case_ids), now_iso()),
+                    )
+                    healed_version_id = create_script_version(
+                        conn,
+                        item,
+                        healed_script,
+                        asset_mode=asset_mode,
+                        case_ids=case_ids,
+                        source_generated_script_id=healed_cursor.lastrowid,
+                        exploration_run_id=flow_row["latest_exploration_run_id"] if "latest_exploration_run_id" in flow_row.keys() else "",
+                    )
                     conn.execute(
-                        "INSERT INTO generated_scripts (work_item_id, content, created_at) VALUES (?, ?, ?)",
-                        (item["id"], healed_script, now_iso()),
+                        "UPDATE generated_scripts SET script_version_id = ? WHERE id = ?",
+                        (healed_version_id, healed_cursor.lastrowid),
                     )
                     conn.execute(
                         """
@@ -5913,10 +7414,17 @@ def js_string(value: str) -> str:
     return json.dumps(value)
 
 
-def write_execution_playwright_config(run_id: str) -> str:
+def write_execution_playwright_config(run_id: str, html_report_index: str | Path | None = None, blob_report_dir: str | Path | None = None) -> str:
     config_dir = EXECUTION_CONFIG_DIR / run_id
     config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / "playwright.config.ts"
+    html_report_dir = Path(html_report_index).parent if html_report_index else REPORT_INDEX.parent
+    reporters = [
+        "    ['list'],",
+        f"    ['html', {{ outputFolder: {js_string(str(html_report_dir))}, open: 'never' }}],",
+    ]
+    if blob_report_dir:
+        reporters.append(f"    ['blob', {{ outputDir: {js_string(str(blob_report_dir))} }}],")
     config_path.write_text(
         f"""import {{ defineConfig, devices }} from '@playwright/test';
 
@@ -5931,8 +7439,7 @@ export default defineConfig({{
   retries: process.env.CI ? 1 : 0,
   workers: process.env.CI ? 1 : undefined,
   reporter: [
-    ['list'],
-    ['html', {{ outputFolder: {js_string(str(REPORT_INDEX.parent))}, open: 'never' }}],
+{chr(10).join(reporters)}
   ],
   use: {{
     baseURL: 'https://www.saucedemo.com',
@@ -5990,6 +7497,8 @@ async def run_playwright(run_id: str, suite: dict[str, Any], work_item_id: str |
     live_spec = suite["spec"]
     live_enabled = False
     execution_config = ""
+    html_report = Path(suite.get("html_report_path") or run_html_report_index(run_id))
+    blob_report_dir = suite.get("blob_report_dir")
     try:
         try:
             target_url = ""
@@ -6016,7 +7525,7 @@ async def run_playwright(run_id: str, suite: dict[str, Any], work_item_id: str |
             await asyncio.sleep(0.3)
 
         update_run(run_id, stage_key="execute", stage_label="执行脚本", progress=58)
-        execution_config = write_execution_playwright_config(run_id)
+        execution_config = write_execution_playwright_config(run_id, html_report, blob_report_dir)
         command = [
             "npx",
             "playwright",
@@ -6025,7 +7534,6 @@ async def run_playwright(run_id: str, suite: dict[str, Any], work_item_id: str |
             execution_config,
             live_spec,
             "--project=chromium",
-            "--reporter=list,html",
         ]
         if suite.get("grep"):
             command.extend(["--grep", suite["grep"]])
@@ -6039,6 +7547,7 @@ async def run_playwright(run_id: str, suite: dict[str, Any], work_item_id: str |
                 **os.environ,
                 "PLAYWRIGHT_HTML_OPEN": "never",
                 "QA_LIVE_SESSION_ID": browser_session_id,
+                **({"PWTEST_BLOB_DO_NOT_REMOVE": "1"} if blob_report_dir else {}),
             },
             limit=BROWSER_WORKER_STREAM_LIMIT_BYTES,
         )
@@ -6083,15 +7592,18 @@ async def run_playwright(run_id: str, suite: dict[str, Any], work_item_id: str |
             progress=100,
             ended_at=now_iso(),
             exit_code=exit_code,
-            report_path=str(REPORT_INDEX),
+            report_path=relative_or_absolute(html_report),
             screenshot_path=str(SCREENSHOT_PATH),
         )
+        publish_latest_playwright_report(html_report)
         write_log(run_id, "success" if exit_code == 0 else "error", f"执行完成，退出码 {exit_code}")
         render_preview(run_id, status, "完成", 100, collected_lines)
         if work_item_id:
             update_work_item(work_item_id, stage="运行验证", status=status, latest_run_id=run_id)
         if suite.get("case_id"):
             with get_db() as conn:
+                if suite.get("script_version_id"):
+                    update_script_version_run(conn, suite["script_version_id"], run_id, status)
                 conn.execute(
                     """
                     UPDATE test_cases
@@ -6108,7 +7620,7 @@ async def run_playwright(run_id: str, suite: dict[str, Any], work_item_id: str |
                         case_row["project_id"],
                         "html-report",
                         f"{case_row['title']} Playwright HTML Report",
-                        REPORT_INDEX,
+                        html_report,
                         work_item_id=work_item_id or "",
                         case_id=suite["case_id"],
                         run_id=run_id,
@@ -6171,6 +7683,215 @@ def health() -> dict[str, Any]:
     return {"status": "ok", "service": "qa-automation-platform", "ai": current_ai_status()}
 
 
+@app.post("/api/auth/login")
+def login(payload: LoginRequest, response: Response) -> dict[str, Any]:
+    username = normalize_username(payload.username)
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        if row is None or not verify_password(payload.password, row["password_hash"]):
+            write_audit_log("login_failed", f"登录失败：{username}", metadata={"username": username})
+            raise HTTPException(status_code=401, detail="账号或密码错误")
+        if row["status"] == "pending":
+            write_audit_log("login_blocked", f"待审核账号尝试登录：{username}", target_user_id=row["id"])
+            raise HTTPException(status_code=403, detail="账号待管理员审核")
+        if row["status"] == "disabled":
+            write_audit_log("login_blocked", f"已禁用账号尝试登录：{username}", target_user_id=row["id"])
+            raise HTTPException(status_code=403, detail="账号已禁用")
+        conn.execute("UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?", (now_iso(), now_iso(), row["id"]))
+    _, token = create_session(row["id"])
+    set_auth_cookie(response, token)
+    user = user_from_session_token(token, refresh=False) or row_to_user(row)
+    write_audit_log("login", f"用户登录：{username}", actor_user_id=user["id"])
+    return {"user": user}
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request, response: Response) -> dict[str, str]:
+    user = current_user_from_request(request)
+    token = request.cookies.get(AUTH_COOKIE_NAME, "")
+    clear_session(token)
+    delete_auth_cookie(response)
+    if user:
+        write_audit_log("logout", f"用户退出：{user['username']}", actor_user_id=user["id"])
+    return {"status": "ok"}
+
+
+@app.post("/api/auth/register")
+def register(payload: RegisterRequest) -> dict[str, Any]:
+    username = validate_username(payload.username)
+    password = validate_password(payload.password)
+    display_name = payload.display_name.strip() or username
+    user_id = uuid.uuid4().hex[:12]
+    timestamp = now_iso()
+    try:
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO users (
+                    id, username, display_name, role, status, password_hash,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, username, display_name, "viewer", "pending", hash_password(password), timestamp, timestamp),
+            )
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="账号已存在")
+    write_audit_log("register", f"用户注册待审核：{username}", target_user_id=user_id)
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    return {"status": "pending", "user": row_to_user(row)}
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request) -> dict[str, Any]:
+    user = current_user_from_request(request)
+    return {"authenticated": bool(user), "user": user}
+
+
+@app.post("/api/auth/change-password")
+def change_password(payload: ChangePasswordRequest, request: Request) -> dict[str, str]:
+    user = require_current_user(request)
+    new_password = validate_password(payload.new_password)
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+        if row is None or not verify_password(payload.current_password, row["password_hash"]):
+            raise HTTPException(status_code=400, detail="当前密码不正确")
+        conn.execute(
+            "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
+            (hash_password(new_password), now_iso(), user["id"]),
+        )
+    write_audit_log("password_changed", f"用户修改密码：{user['username']}", actor_user_id=user["id"], target_user_id=user["id"])
+    return {"status": "ok"}
+
+
+@app.get("/api/users")
+def users(request: Request) -> list[dict[str, Any]]:
+    require_role_user(request, {"admin"})
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM users ORDER BY status ASC, updated_at DESC").fetchall()
+    return [row_to_user(row) for row in rows]
+
+
+@app.post("/api/users")
+def create_user(payload: UserCreateRequest, request: Request) -> dict[str, Any]:
+    actor = require_role_user(request, {"admin"})
+    username = validate_username(payload.username)
+    password = validate_password(payload.password)
+    display_name = payload.display_name.strip() or username
+    role = payload.role.strip()
+    status = payload.status.strip()
+    if role not in USER_ROLES:
+        raise HTTPException(status_code=400, detail="角色无效")
+    if status not in USER_STATUSES:
+        raise HTTPException(status_code=400, detail="状态无效")
+    user_id = uuid.uuid4().hex[:12]
+    timestamp = now_iso()
+    try:
+        with get_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO users (
+                    id, username, display_name, role, status, password_hash,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, username, display_name, role, status, hash_password(password), timestamp, timestamp),
+            )
+            row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="账号已存在")
+    write_audit_log(
+        "user_created",
+        f"管理员创建用户：{username}",
+        actor_user_id=actor["id"],
+        target_user_id=user_id,
+        metadata={"role": role, "status": status},
+    )
+    return row_to_user(row)
+
+
+@app.patch("/api/users/{user_id}")
+def update_user(user_id: str, payload: UserPatchRequest, request: Request) -> dict[str, Any]:
+    actor = require_role_user(request, {"admin"})
+    fields: dict[str, Any] = {}
+    if payload.display_name is not None:
+        display_name = payload.display_name.strip()
+        if not display_name:
+            raise HTTPException(status_code=400, detail="昵称不能为空")
+        fields["display_name"] = display_name
+    if payload.role is not None:
+        role = payload.role.strip()
+        if role not in USER_ROLES:
+            raise HTTPException(status_code=400, detail="角色无效")
+        fields["role"] = role
+    if payload.status is not None:
+        status = payload.status.strip()
+        if status not in USER_STATUSES:
+            raise HTTPException(status_code=400, detail="状态无效")
+        fields["status"] = status
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        if row["username"] == DEFAULT_ADMIN_USERNAME and fields.get("status") == "disabled":
+            raise HTTPException(status_code=400, detail="默认管理员不能禁用")
+        if row["username"] == DEFAULT_ADMIN_USERNAME and fields.get("role") and fields["role"] != "admin":
+            raise HTTPException(status_code=400, detail="默认管理员不能降级")
+        if fields:
+            fields["updated_at"] = now_iso()
+            keys = ", ".join(f"{key} = ?" for key in fields)
+            conn.execute(f"UPDATE users SET {keys} WHERE id = ?", [*fields.values(), user_id])
+            if fields.get("status") == "disabled":
+                conn.execute("DELETE FROM auth_sessions WHERE user_id = ?", (user_id,))
+        updated = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    write_audit_log(
+        "user_updated",
+        f"管理员更新用户：{updated['username']}",
+        actor_user_id=actor["id"],
+        target_user_id=user_id,
+        metadata={key: value for key, value in fields.items() if key != "updated_at"},
+    )
+    return row_to_user(updated)
+
+
+@app.delete("/api/users/{user_id}")
+def delete_user(user_id: str, request: Request) -> dict[str, str]:
+    actor = require_role_user(request, {"admin"})
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        if row["username"] == DEFAULT_ADMIN_USERNAME:
+            raise HTTPException(status_code=400, detail="默认管理员不能删除")
+        conn.execute("DELETE FROM auth_sessions WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    write_audit_log(
+        "user_deleted",
+        f"管理员删除用户：{row['username']}",
+        actor_user_id=actor["id"],
+        target_user_id=user_id,
+        metadata={"username": row["username"]},
+    )
+    return {"status": "deleted", "id": user_id}
+
+
+@app.post("/api/users/{user_id}/reset-password")
+def reset_user_password(user_id: str, payload: ResetPasswordRequest, request: Request) -> dict[str, str]:
+    actor = require_role_user(request, {"admin"})
+    password = validate_password(payload.password)
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        conn.execute(
+            "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
+            (hash_password(password), now_iso(), user_id),
+        )
+        conn.execute("DELETE FROM auth_sessions WHERE user_id = ?", (user_id,))
+    write_audit_log("password_reset", f"管理员重置用户密码：{row['username']}", actor_user_id=actor["id"], target_user_id=user_id)
+    return {"status": "ok"}
+
+
 @app.get("/api/dashboard-summary")
 def dashboard_summary(project_id: str = "all") -> dict[str, Any]:
     return dashboard_summary_payload(project_id)
@@ -6221,35 +7942,68 @@ def reset_test_data() -> dict[str, Any]:
 
 @app.get("/api/ai-config")
 def get_ai_config() -> dict[str, Any]:
-    status = current_ai_status()
-    local_key = get_setting("openai_api_key")
-    env_key = os.environ.get("OPENAI_API_KEY", "")
-    active_key = env_key or local_key
-    masked = f"{active_key[:7]}...{active_key[-4:]}" if len(active_key) > 12 else "已配置" if active_key else ""
-    return {**status, "maskedKey": masked, "envLocked": bool(env_key)}
+    return current_ai_status()
 
 
 @app.post("/api/ai-config")
 def save_ai_config(payload: AIConfigRequest) -> dict[str, Any]:
     api_key = payload.api_key.strip()
-    model = payload.model.strip() or "gpt-4.1-mini"
+    provider = normalize_ai_provider(payload.provider)
+    model = payload.model.strip() or DEFAULT_OPENAI_MODEL
     base_url = normalize_openai_base_url(payload.base_url)
     validate_openai_base_url(base_url)
+    profiles = get_ai_profiles()
+    existing = next((profile for profile in profiles if profile["id"] == payload.id.strip()), None)
+    if not api_key and existing:
+        api_key = existing.get("api_key", "")
     if not api_key and not os.environ.get("OPENAI_API_KEY"):
         raise HTTPException(status_code=400, detail="请输入 OpenAI API Key")
-    if api_key:
-        set_setting("openai_api_key", api_key)
-    set_setting("openai_model", model)
-    if not os.environ.get("OPENAI_BASE_URL"):
-        set_setting("openai_base_url", base_url)
+    profile_id = existing["id"] if existing else (payload.id.strip() or uuid.uuid4().hex[:12])
+    profile = normalize_ai_profile(
+        {
+            "id": profile_id,
+            "name": payload.name.strip() or (existing["name"] if existing else default_ai_profile_name(provider)),
+            "provider": provider,
+            "api_key": api_key,
+            "model": model,
+            "base_url": base_url,
+            "updated_at": now_iso(),
+        }
+    )
+    next_profiles = [item for item in profiles if item["id"] != profile_id]
+    next_profiles.insert(0, profile)
+    save_ai_profiles(next_profiles, profile_id)
+    write_audit_log("ai_config_saved", f"AI 配置已保存：{profile['name']}", target_user_id="")
     return get_ai_config()
+
+
+@app.post("/api/ai-config/active")
+def set_active_ai_config(payload: AIActiveConfigRequest) -> dict[str, Any]:
+    profile_id = payload.profile_id.strip()
+    profiles = get_ai_profiles()
+    if not any(profile["id"] == profile_id for profile in profiles):
+        raise HTTPException(status_code=404, detail="AI 配置档案不存在")
+    set_setting(AI_ACTIVE_PROFILE_SETTING_KEY, profile_id)
+    write_audit_log("ai_config_active", f"AI 配置已切换：{profile_id}")
+    return get_ai_config()
+
+
+@app.get("/api/ai-config/{profile_id}/secret")
+def get_ai_config_secret(profile_id: str) -> dict[str, Any]:
+    profile_id = profile_id.strip()
+    profile = next((item for item in get_ai_profiles() if item["id"] == profile_id), None)
+    if not profile:
+        raise HTTPException(status_code=404, detail="AI 配置档案不存在")
+    return {"id": profile["id"], "apiKey": profile.get("api_key", "")}
 
 
 @app.post("/api/ai-config/test")
 def test_ai_config(payload: AIConfigRequest) -> dict[str, Any]:
-    api_key = payload.api_key.strip() or get_openai_api_key()
-    model = payload.model.strip() or get_openai_model()
-    base_url = normalize_openai_base_url(payload.base_url or get_openai_base_url())
+    profiles = get_ai_profiles()
+    existing = next((profile for profile in profiles if profile["id"] == payload.id.strip()), None)
+    api_key = payload.api_key.strip() or os.environ.get("OPENAI_API_KEY") or (existing.get("api_key", "") if existing else get_openai_api_key())
+    model = payload.model.strip() or (existing.get("model", "") if existing else get_openai_model())
+    base_url = normalize_openai_base_url(payload.base_url or (existing.get("base_url", "") if existing else get_openai_base_url()))
     validate_openai_base_url(base_url)
     if not api_key:
         raise HTTPException(status_code=400, detail="请输入 OpenAI API Key 后再测试连接")
@@ -6260,13 +8014,14 @@ def test_ai_config(payload: AIConfigRequest) -> dict[str, Any]:
         "max_output_tokens": 8,
     }
     try:
-        body = call_openai_responses(api_key, model, base_url, request_payload, timeout=12)
+        body = call_openai_responses(api_key, model, base_url, request_payload, timeout=12, provider=payload.provider or (existing.get("provider", "") if existing else ""))
         text = parse_openai_text_response(body).strip()
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=502, detail=openai_error_message(exc)) from exc
     return {
         "ok": True,
         "message": f"连接成功，模型 {model} 已完成一次测试生成。",
+        "provider": normalize_ai_provider(payload.provider or (existing.get("provider", "") if existing else "openai")),
         "model": model,
         "baseUrl": base_url,
         "sample": text[:80],
@@ -6274,17 +8029,34 @@ def test_ai_config(payload: AIConfigRequest) -> dict[str, Any]:
 
 
 @app.delete("/api/ai-config")
-def clear_ai_config() -> dict[str, Any]:
+def clear_ai_config(profile_id: str = "") -> dict[str, Any]:
+    target_profile_id = profile_id.strip()
+    if target_profile_id:
+        profiles = get_ai_profiles()
+        next_profiles = [profile for profile in profiles if profile["id"] != target_profile_id]
+        if len(next_profiles) == len(profiles):
+            raise HTTPException(status_code=404, detail="AI 配置档案不存在")
+        active_id = get_setting(AI_ACTIVE_PROFILE_SETTING_KEY)
+        next_active_id = next_profiles[0]["id"] if next_profiles and active_id == target_profile_id else active_id
+        save_ai_profiles(next_profiles, next_active_id)
+        if not next_profiles:
+            with get_db() as conn:
+                conn.execute("DELETE FROM app_settings WHERE key IN (?, ?)", (AI_PROFILES_SETTING_KEY, AI_ACTIVE_PROFILE_SETTING_KEY))
+        write_audit_log("ai_config_deleted", f"AI 配置已删除：{target_profile_id}")
+        return get_ai_config()
     with get_db() as conn:
-        conn.execute("DELETE FROM app_settings WHERE key = 'openai_api_key'")
+        conn.execute("DELETE FROM app_settings WHERE key IN (?, ?, ?, ?)", (AI_PROFILES_SETTING_KEY, AI_ACTIVE_PROFILE_SETTING_KEY, "openai_api_key", "openai_model"))
         if not os.environ.get("OPENAI_BASE_URL"):
             conn.execute("DELETE FROM app_settings WHERE key = 'openai_base_url'")
+    write_audit_log("ai_config_cleared", "本地 AI 配置已清除")
     return get_ai_config()
 
 
 @app.get("/api/test-suites")
 def test_suites(project_id: str = "") -> list[dict[str, Any]]:
     normalized_project_id = normalize_project_id(project_id)
+    if not normalized_project_id:
+        return []
     with get_db() as conn:
         rows = conn.execute(
             "SELECT * FROM test_suites WHERE project_id = ? ORDER BY updated_at DESC",
@@ -6419,19 +8191,20 @@ def update_project(project_id: str, payload: ProjectPatchRequest) -> dict[str, A
 @app.delete("/api/projects/{project_id}")
 def delete_project(project_id: str) -> dict[str, Any]:
     project = get_project_row(project_id)
-    if project_id == DEFAULT_PROJECT_ID:
-        raise HTTPException(status_code=400, detail="默认项目不能删除")
     with get_db() as conn:
         counts = project_dependency_counts(conn, project_id)
         if any(counts.values()):
             raise HTTPException(status_code=400, detail="项目下仍有关联资产，请先清理需求、用例、交付物、套件或执行记录")
         conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+    write_audit_log("project_deleted", f"项目已删除：{project['name']}", metadata={"projectId": project_id})
     return {"status": "deleted", "id": project_id, "name": project["name"]}
 
 
 @app.get("/api/features")
 def feature_menus(project_id: str = "") -> dict[str, Any]:
     normalized_project_id = normalize_project_id(project_id)
+    if not normalized_project_id:
+        return {"items": [], "tree": []}
     get_project_row(normalized_project_id)
     with get_db() as conn:
         return features_payload(conn, normalized_project_id)
@@ -6442,11 +8215,10 @@ def create_feature_menu(payload: FeatureMenuRequest) -> dict[str, Any]:
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="功能名称不能为空")
-    project_id = normalize_project_id(payload.project_id)
-    get_project_row(project_id)
     feature_id = uuid.uuid4().hex[:12]
     timestamp = now_iso()
     with get_db() as conn:
+        project_id = validate_project_id(conn, payload.project_id)
         parent_id = validate_feature_parent(conn, project_id, payload.parent_id)
         conn.execute(
             """
@@ -6512,13 +8284,17 @@ def delete_feature_menu(feature_id: str) -> dict[str, Any]:
         if case_count:
             raise HTTPException(status_code=400, detail="该功能已绑定测试用例，不能删除")
         conn.execute("DELETE FROM feature_menus WHERE id = ?", (feature_id,))
+    write_audit_log("feature_deleted", f"功能已删除：{feature['name']}", metadata={"featureId": feature_id})
     return {"status": "deleted", "id": feature_id, "name": feature["name"]}
 
 
 @app.get("/api/test-cases")
 def test_cases(project_id: str = "", work_item_id: str = "", status: str = "", priority: str = "", feature_id: str = "") -> list[dict[str, Any]]:
+    normalized_project_id = normalize_project_id(project_id)
+    if not normalized_project_id:
+        return []
     clauses = ["project_id = ?"]
-    params: list[Any] = [normalize_project_id(project_id)]
+    params: list[Any] = [normalized_project_id]
     if work_item_id:
         clauses.append("work_item_id = ?")
         params.append(work_item_id)
@@ -6544,11 +8320,11 @@ def create_test_case(payload: TestCaseRequest) -> dict[str, Any]:
     title = payload.title.strip()
     if not title:
         raise HTTPException(status_code=400, detail="用例标题不能为空")
-    project_id = normalize_project_id(payload.project_id)
     case_id = uuid.uuid4().hex[:12]
     external_id = payload.external_id.strip() or f"TC-{case_id[:8].upper()}"
     timestamp = now_iso()
     with get_db() as conn:
+        project_id = validate_project_id(conn, payload.project_id)
         feature_id = validate_case_feature(conn, project_id, payload.feature_id)
         conn.execute(
             """
@@ -6612,6 +8388,101 @@ def update_test_case(case_id: str, payload: TestCasePatchRequest) -> dict[str, A
     return row_to_test_case(row)
 
 
+@app.post("/api/test-cases/bulk-delete")
+def bulk_delete_test_cases(payload: TestCaseBulkDeleteRequest) -> dict[str, Any]:
+    case_ids = list(dict.fromkeys(case_id.strip() for case_id in payload.case_ids if case_id.strip()))
+    with get_db() as conn:
+        deleted_count = delete_test_case_rows(conn, case_ids)
+    write_audit_log("test_cases_bulk_deleted", f"批量删除用例：{deleted_count} 条", metadata={"caseIds": case_ids})
+    return {"status": "deleted", "ids": case_ids, "deleted": deleted_count}
+
+
+@app.delete("/api/test-cases/{case_id}")
+def delete_test_case(case_id: str) -> dict[str, Any]:
+    with get_db() as conn:
+        row = conn.execute("SELECT external_id, title FROM test_cases WHERE id = ?", (case_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Test case not found")
+        deleted_count = delete_test_case_rows(conn, [case_id])
+    write_audit_log("test_case_deleted", f"用例已删除：{row['external_id']} {row['title']}", metadata={"caseId": case_id})
+    return {
+        "status": "deleted",
+        "id": case_id,
+        "deleted": deleted_count,
+        "externalId": row["external_id"],
+        "title": row["title"],
+    }
+
+
+@app.get("/api/script-versions/{script_version_id}")
+def get_script_version(script_version_id: str) -> dict[str, Any]:
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM test_script_versions WHERE id = ?", (script_version_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="脚本版本不存在")
+        return row_to_script_version_detail(conn, row)
+
+
+@app.post("/api/script-versions/{script_version_id}/draft")
+def create_script_version_draft(script_version_id: str, payload: ScriptDraftRequest) -> dict[str, Any]:
+    content = payload.content
+    if not content.strip():
+        raise HTTPException(status_code=400, detail="脚本内容不能为空")
+    if "test(" not in content or "expect(" not in content:
+        raise HTTPException(status_code=400, detail="脚本基础校验失败：需要包含 test 和 expect")
+    content = ensure_verbose_playwright_logging(content)
+    with get_db() as conn:
+        source_row = conn.execute("SELECT * FROM test_script_versions WHERE id = ?", (script_version_id,)).fetchone()
+        if source_row is None:
+            raise HTTPException(status_code=404, detail="脚本版本不存在")
+        item = conn.execute("SELECT * FROM work_items WHERE id = ?", (source_row["work_item_id"],)).fetchone()
+        if item is None:
+            raise HTTPException(status_code=404, detail="脚本所属工单不存在")
+        stored_case_ids = safe_json_loads(source_row["case_ids_json"] if "case_ids_json" in source_row.keys() else "", [])
+        case_ids = normalize_case_ids(stored_case_ids if isinstance(stored_case_ids, list) else [])
+        if not case_ids:
+            case_ids = [
+                row["case_id"]
+                for row in conn.execute(
+                    "SELECT case_id FROM test_case_script_bindings WHERE script_version_id = ? ORDER BY bound_at ASC",
+                    (script_version_id,),
+                ).fetchall()
+            ]
+        asset_mode = source_row["asset_mode"] if "asset_mode" in source_row.keys() and source_row["asset_mode"] else "create"
+        timestamp = now_iso()
+        script_cursor = conn.execute(
+            """
+            INSERT INTO generated_scripts (work_item_id, content, asset_mode, case_ids_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (item["id"], content, normalize_asset_mode(asset_mode), json_case_ids(case_ids), timestamp),
+        )
+        draft_version_id = create_script_version(
+            conn,
+            item,
+            content,
+            asset_mode=asset_mode,
+            case_ids=case_ids,
+            source_generated_script_id=script_cursor.lastrowid,
+            exploration_run_id=source_row["exploration_run_id"] if "exploration_run_id" in source_row.keys() else "",
+        )
+        conn.execute(
+            "UPDATE generated_scripts SET script_version_id = ? WHERE id = ?",
+            (draft_version_id, script_cursor.lastrowid),
+        )
+        conn.execute(
+            "UPDATE work_items SET asset_mode = ?, case_ids_json = ?, updated_at = ? WHERE id = ?",
+            (normalize_asset_mode(asset_mode), json_case_ids(case_ids), timestamp, item["id"]),
+        )
+        draft_row = conn.execute("SELECT * FROM test_script_versions WHERE id = ?", (draft_version_id,)).fetchone()
+        write_audit_log(
+            "script_draft_created",
+            f"脚本已另存为草稿版本：{item['title']} v{draft_row['version']}",
+            metadata={"sourceScriptVersionId": script_version_id, "draftScriptVersionId": draft_version_id, "workItemId": item["id"]},
+        )
+        return row_to_script_version_detail(conn, draft_row)
+
+
 @app.get("/api/deliverables")
 def deliverables(
     project_id: str = "",
@@ -6665,6 +8536,7 @@ def delivery_report(
     project_id: str = "",
     work_item_id: str = "",
     case_id: str = "",
+    readiness: str = "",
     q: str = "",
     priority: str = "",
     automation_status: str = "",
@@ -6679,6 +8551,7 @@ def delivery_report(
     page_size = min(max(1, page_size), 200)
     clauses: list[str] = []
     params: list[Any] = []
+    readiness_sql, _, _ = delivery_report_readiness_sql()
     updated_sql = f"""
         MAX(
             tc.updated_at,
@@ -6701,6 +8574,9 @@ def delivery_report(
     if case_id:
         clauses.append("tc.id = ?")
         params.append(case_id)
+    if readiness in {"ready", "missing", "risk"}:
+        clauses.append(f"({readiness_sql}) = ?")
+        params.append(readiness)
     if priority:
         clauses.append("tc.priority = ?")
         params.append(priority)
@@ -6774,12 +8650,20 @@ def delivery_report(
     offset = (page - 1) * page_size
     with get_db() as conn:
         total = conn.execute(f"SELECT COUNT(*) AS total FROM test_cases tc {where_sql}", params).fetchone()["total"]
+        summary = delivery_report_summary(conn, where_sql, params)
         rows = conn.execute(
             f"""
             SELECT tc.*, {updated_sql} AS report_updated_at
             FROM test_cases tc
             {where_sql}
-            ORDER BY report_updated_at DESC, tc.external_id ASC
+            ORDER BY
+                CASE ({readiness_sql})
+                    WHEN 'missing' THEN 0
+                    WHEN 'risk' THEN 1
+                    ELSE 2
+                END,
+                report_updated_at DESC,
+                tc.external_id ASC
             LIMIT ? OFFSET ?
             """,
             [*params, page_size, offset],
@@ -6790,6 +8674,7 @@ def delivery_report(
         "total": total,
         "page": page,
         "pageSize": page_size,
+        "summary": summary,
     }
 
 
@@ -6802,7 +8687,7 @@ def create_deliverable(payload: DeliverableRequest) -> dict[str, Any]:
     content = payload.content
     if not file_path:
         safe_name = slugify(payload.name or payload.type)
-        file_path = str(PROJECT_ARTIFACT_DIR / DEFAULT_PROJECT_SLUG / "deliverables" / "manual" / f"{safe_name}.md")
+        file_path = str(PROJECT_ARTIFACT_DIR / project_id / "deliverables" / "manual" / f"{safe_name}.md")
     path = resolve_workspace_path(file_path)
     if content:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -6833,9 +8718,9 @@ def create_test_suite(payload: SuiteRequest) -> dict[str, Any]:
     if not name:
         raise HTTPException(status_code=400, detail="套件名称不能为空")
     suite_id = uuid.uuid4().hex[:12]
-    project_id = normalize_project_id(payload.project_id)
     timestamp = now_iso()
     with get_db() as conn:
+        project_id = validate_project_id(conn, payload.project_id)
         conn.execute(
             """
             INSERT INTO test_suites (
@@ -6907,6 +8792,7 @@ def delete_test_suite(suite_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=404, detail="Test suite not found")
         conn.execute("DELETE FROM test_suite_cases WHERE suite_id = ?", (suite_id,))
         conn.execute("DELETE FROM test_suites WHERE id = ?", (suite_id,))
+    write_audit_log("test_suite_deleted", f"套件已删除：{suite['name']}", metadata={"suiteId": suite_id})
     return {"ok": True, "id": suite_id}
 
 
@@ -6956,7 +8842,7 @@ def selected_suite_cases(conn: sqlite3.Connection, payload: SuiteRunRequest) -> 
         ).fetchall()
         if len(rows) != len(set(payload.case_ids)):
             raise HTTPException(status_code=400, detail="存在无效用例，不能执行")
-        project_id = rows[0]["project_id"] if rows else DEFAULT_PROJECT_ID
+        project_id = rows[0]["project_id"] if rows else ""
         return "", project_id, rows
     if payload.suite_id:
         suite = conn.execute("SELECT * FROM test_suites WHERE id = ?", (payload.suite_id,)).fetchone()
@@ -6990,6 +8876,9 @@ async def execute_suite_run(suite_run_id: str) -> None:
         return
 
     update_suite_run(suite_run_id, status="running")
+    blob_dir = suite_blob_report_dir(suite_run_id)
+    with contextlib.suppress(FileNotFoundError):
+        shutil.rmtree(blob_dir)
     for index, link in enumerate(case_links, start=1):
         with get_db() as conn:
             case_row = conn.execute("SELECT * FROM test_cases WHERE id = ?", (link["case_id"],)).fetchone()
@@ -7002,7 +8891,8 @@ async def execute_suite_run(suite_run_id: str) -> None:
             refresh_suite_run_counts(suite_run_id)
             continue
 
-        spec_path = case_row["spec_path"] or ""
+        with get_db() as conn:
+            spec_path, grep_pattern, script_version_id = active_spec_for_case(conn, case_row)
         if not spec_path or not resolve_workspace_path(spec_path).exists():
             with get_db() as conn:
                 conn.execute(
@@ -7021,6 +8911,7 @@ async def execute_suite_run(suite_run_id: str) -> None:
             continue
 
         run_id = uuid.uuid4().hex[:12]
+        html_report = run_html_report_index(run_id)
         suite = {
             "id": case_row["external_id"],
             "name": case_row["title"],
@@ -7028,8 +8919,11 @@ async def execute_suite_run(suite_run_id: str) -> None:
             "priority": case_row["priority"] or "P1",
             "cases": 1,
             "description": case_row["requirement"] or case_row["title"],
-            "grep": re.escape(case_row["external_id"]),
+            "grep": grep_pattern,
             "case_id": case_row["id"],
+            "script_version_id": script_version_id,
+            "html_report_path": html_report,
+            "blob_report_dir": blob_dir,
         }
         with get_db() as conn:
             conn.execute(
@@ -7049,7 +8943,7 @@ async def execute_suite_run(suite_run_id: str) -> None:
                     "准备环境",
                     6,
                     now_iso(),
-                    str(REPORT_INDEX),
+                    relative_or_absolute(html_report),
                     str(SCREENSHOT_PATH),
                     case_row["work_item_id"],
                 ),
@@ -7084,7 +8978,30 @@ async def execute_suite_run(suite_run_id: str) -> None:
     with get_db() as conn:
         summary = conn.execute("SELECT * FROM suite_runs WHERE id = ?", (suite_run_id,)).fetchone()
     final_status = "failed" if summary["failed_cases"] else "passed" if summary["passed_cases"] else "skipped"
-    update_suite_run(suite_run_id, status=final_status, progress=100, ended_at=now_iso(), report_path=relative_or_absolute(REPORT_INDEX))
+    suite_report_path = ""
+    try:
+        suite_report = await merge_suite_html_report(suite_run_id)
+        if suite_report is not None:
+            suite_report_path = relative_or_absolute(suite_report)
+            publish_latest_playwright_report(suite_report)
+    except Exception as exc:
+        with get_db() as conn:
+            run_ids = [
+                row["run_id"]
+                for row in conn.execute(
+                    "SELECT run_id FROM suite_run_cases WHERE suite_run_id = ? AND run_id IS NOT NULL AND run_id != ''",
+                    (suite_run_id,),
+                ).fetchall()
+            ]
+        for run_id in run_ids:
+            write_log(run_id, "warning", f"套件 HTML report 聚合失败，已保留单用例报告: {exc}")
+    update_suite_run(
+        suite_run_id,
+        status=final_status,
+        progress=100,
+        ended_at=now_iso(),
+        report_path=suite_report_path or relative_or_absolute(REPORT_INDEX),
+    )
 
 
 @app.post("/api/suite-runs")
@@ -7119,15 +9036,19 @@ async def create_suite_run(payload: SuiteRunRequest) -> dict[str, Any]:
             )
         row = conn.execute("SELECT * FROM suite_runs WHERE id = ?", (suite_run_id,)).fetchone()
     asyncio.create_task(execute_suite_run(suite_run_id))
+    write_audit_log("suite_run_started", f"测试执行已启动：{suite_name}", metadata={"suiteRunId": suite_run_id, "totalCases": len(rows)})
     return row_to_suite_run(row)
 
 
 @app.get("/api/suite-runs")
 def suite_runs(project_id: str = "") -> list[dict[str, Any]]:
+    normalized_project_id = normalize_project_id(project_id)
+    if not normalized_project_id:
+        return []
     with get_db() as conn:
         rows = conn.execute(
             "SELECT * FROM suite_runs WHERE project_id = ? ORDER BY started_at DESC LIMIT 20",
-            (normalize_project_id(project_id),),
+            (normalized_project_id,),
         ).fetchall()
     return [row_to_suite_run(row, include_cases=False) for row in rows]
 
@@ -7192,7 +9113,9 @@ def create_work_item(payload: WorkItemRequest) -> dict[str, Any]:
     timestamp = now_iso()
     with get_db() as conn:
         project_id = validate_project_id(conn, payload.project_id)
-        feature_id = validate_project_feature(conn, project_id, payload.feature_id)
+        feature_id = validate_project_feature(conn, project_id, payload.feature_id, required=True)
+        asset_mode = normalize_asset_mode(payload.asset_mode or ("refresh" if payload.case_ids else "create"))
+        case_ids = validate_case_ids_for_project(conn, project_id, normalize_case_ids(payload.case_ids))
         existing = conn.execute("SELECT id FROM work_items WHERE slug = ?", (slug,)).fetchone()
         if existing:
             slug = slug_for_work_item(title, work_item_id)
@@ -7200,8 +9123,9 @@ def create_work_item(payload: WorkItemRequest) -> dict[str, Any]:
             """
             INSERT INTO work_items (
                 id, slug, title, requirement, target_url, role, test_data, acceptance,
-                exclusions, stage, status, created_at, updated_at, analysis_json, project_id, feature_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                exclusions, stage, status, created_at, updated_at, analysis_json, project_id,
+                feature_id, asset_mode, case_ids_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 work_item_id,
@@ -7220,6 +9144,8 @@ def create_work_item(payload: WorkItemRequest) -> dict[str, Any]:
                 json.dumps(analysis, ensure_ascii=False),
                 project_id,
                 feature_id,
+                asset_mode,
+                json_case_ids(case_ids),
             ),
         )
     return get_work_item(work_item_id)
@@ -7256,16 +9182,25 @@ async def create_automation_flow(payload: AutomationFlowRequest) -> dict[str, An
     flow_run_id = uuid.uuid4().hex[:12]
     timestamp = now_iso()
     work_item_id = ""
-    project_id = DEFAULT_PROJECT_ID
+    project_id = ""
     feature_id = ""
     status = "queued"
     stage = "需求分析"
     error = ""
+    asset_mode = normalize_asset_mode(payload.asset_mode or ("refresh" if payload.case_ids else "create"))
+    case_ids: list[str] = []
     if requirement:
         with get_db() as conn:
             project_id = validate_project_id(conn, payload.project_id)
             feature_id = validate_project_feature(conn, project_id, payload.feature_id, required=True)
-        item = create_work_item(WorkItemRequest(requirement=requirement, project_id=project_id, feature_id=feature_id))
+            case_ids = validate_case_ids_for_project(conn, project_id, normalize_case_ids(payload.case_ids))
+        item = create_work_item(WorkItemRequest(
+            requirement=requirement,
+            project_id=project_id,
+            feature_id=feature_id,
+            asset_mode=asset_mode,
+            case_ids=case_ids,
+        ))
         work_item_id = item["id"]
     else:
         status = "blocked"
@@ -7276,8 +9211,9 @@ async def create_automation_flow(payload: AutomationFlowRequest) -> dict[str, An
             INSERT INTO automation_flow_runs (
                 id, work_item_id, feature_id, status, stage, progress, current_attempt,
                 latest_run_id, latest_exploration_run_id, cases_path, spec_path,
-                report_path, html_report_path, error, started_at, ended_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                report_path, html_report_path, error, asset_mode, case_ids_json,
+                started_at, ended_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 flow_run_id,
@@ -7294,6 +9230,8 @@ async def create_automation_flow(payload: AutomationFlowRequest) -> dict[str, An
                 "",
                 "",
                 error,
+                asset_mode,
+                json_case_ids(case_ids),
                 timestamp,
                 now_iso() if not requirement else None,
             ),
@@ -7303,6 +9241,7 @@ async def create_automation_flow(payload: AutomationFlowRequest) -> dict[str, An
     else:
         write_automation_flow_log(flow_run_id, "需求分析", "info", f"真实全流程 run 已创建: {flow_run_id}", "work-item", "", work_item_id)
         asyncio.create_task(execute_automation_flow(flow_run_id))
+        write_audit_log("automation_flow_started", "一键全流程已启动", metadata={"flowRunId": flow_run_id, "projectId": project_id})
     return get_automation_flow_payload(flow_run_id)
 
 
@@ -7319,6 +9258,9 @@ def get_automation_flow_artifacts(flow_run_id: str) -> list[dict[str, Any]]:
 
 @app.websocket("/ws/automation-flows/{flow_run_id}")
 async def automation_flow_socket(websocket: WebSocket, flow_run_id: str) -> None:
+    if current_user_from_websocket(websocket) is None:
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     try:
         payload = get_automation_flow_payload(flow_run_id)
@@ -7358,6 +9300,9 @@ async def create_browser_session(work_item_id: str) -> dict[str, Any]:
 
 @app.websocket("/ws/browser-sessions/{session_id}")
 async def browser_session_socket(websocket: WebSocket, session_id: str) -> None:
+    if current_user_from_websocket(websocket) is None:
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     runtime = BROWSER_RUNTIMES.get(session_id)
     if runtime is None:
@@ -7488,16 +9433,35 @@ def get_exploration_run(exploration_run_id: str) -> dict[str, Any]:
 @app.post("/api/work-items/{work_item_id}/generate-cases")
 def generate_cases(work_item_id: str, payload: ContentRequest) -> dict[str, Any]:
     item = get_work_item_row(work_item_id)
+    project_id = require_work_item_project_id(item)
     content = payload.content.strip()
     if not content:
         require_ai()
         content = default_cases(item)
     with get_db() as conn:
+        asset_mode, case_ids = work_item_asset_defaults(conn, item, payload.asset_mode, payload.case_ids)
+        if asset_mode == "create":
+            content = rewrite_create_mode_case_ids(conn, project_id, work_item_id, content, case_ids)
         conn.execute(
-            "INSERT INTO generated_cases (work_item_id, content, created_at) VALUES (?, ?, ?)",
-            (work_item_id, content, now_iso()),
+            """
+            INSERT INTO generated_cases (work_item_id, content, asset_mode, case_ids_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (work_item_id, content, asset_mode, json_case_ids(case_ids), now_iso()),
         )
-        sync_test_cases_from_markdown(conn, item["project_id"] or DEFAULT_PROJECT_ID, work_item_id, content, default_feature_id=item["feature_id"] if "feature_id" in item.keys() else "")
+        synced_case_ids = sync_test_cases_from_markdown(
+            conn,
+            project_id,
+            work_item_id,
+            content,
+            default_feature_id=item["feature_id"] if "feature_id" in item.keys() else "",
+            asset_mode=asset_mode,
+            case_ids=case_ids,
+        )
+        conn.execute(
+            "UPDATE work_items SET asset_mode = ?, case_ids_json = ?, updated_at = ? WHERE id = ?",
+            (asset_mode, json_case_ids(synced_case_ids), now_iso(), work_item_id),
+        )
     update_work_item(work_item_id, stage="页面探索", status="cases-ready")
     return get_work_item(work_item_id)
 
@@ -7507,6 +9471,7 @@ def generate_script(work_item_id: str, payload: ContentRequest) -> dict[str, Any
     item = get_work_item_row(work_item_id)
     content = payload.content.strip()
     with get_db() as conn:
+        asset_mode, case_ids = work_item_asset_defaults(conn, item, payload.asset_mode, payload.case_ids)
         cases_markdown = latest_content(conn, "generated_cases", work_item_id)
         elements = conn.execute(
             "SELECT * FROM confirmed_elements WHERE work_item_id = ? AND confirmed = 1 ORDER BY id ASC",
@@ -7519,10 +9484,31 @@ def generate_script(work_item_id: str, payload: ContentRequest) -> dict[str, Any
     if not content:
         require_ai()
         content = default_script(item, elements)
+    content = ensure_verbose_playwright_logging(content)
     with get_db() as conn:
+        script_cursor = conn.execute(
+            """
+            INSERT INTO generated_scripts (work_item_id, content, asset_mode, case_ids_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (work_item_id, content, asset_mode, json_case_ids(case_ids), now_iso()),
+        )
+        script_version_id = create_script_version(
+            conn,
+            item,
+            content,
+            asset_mode=asset_mode,
+            case_ids=case_ids,
+            source_generated_script_id=script_cursor.lastrowid,
+            exploration_run_id=item["latest_exploration_run_id"] if "latest_exploration_run_id" in item.keys() else "",
+        )
         conn.execute(
-            "INSERT INTO generated_scripts (work_item_id, content, created_at) VALUES (?, ?, ?)",
-            (work_item_id, content, now_iso()),
+            "UPDATE generated_scripts SET script_version_id = ? WHERE id = ?",
+            (script_version_id, script_cursor.lastrowid),
+        )
+        conn.execute(
+            "UPDATE work_items SET asset_mode = ?, case_ids_json = ?, updated_at = ? WHERE id = ?",
+            (asset_mode, json_case_ids(case_ids), now_iso(), work_item_id),
         )
     update_work_item(work_item_id, stage="运行验证", status="script-ready")
     return get_work_item(work_item_id)
@@ -7531,12 +9517,13 @@ def generate_script(work_item_id: str, payload: ContentRequest) -> dict[str, Any
 @app.post("/api/work-items/{work_item_id}/save-artifacts")
 def save_artifacts(work_item_id: str, payload: SaveArtifactsRequest) -> dict[str, Any]:
     item = get_work_item_row(work_item_id)
-    project_id = item["project_id"] or DEFAULT_PROJECT_ID
+    project_id = require_work_item_project_id(item)
     feature_id = item["feature_id"] if "feature_id" in item.keys() else ""
     project = get_project_row(project_id)
     with get_db() as conn:
         cases = payload.cases_markdown.strip() or latest_content(conn, "generated_cases", work_item_id)
         script = payload.script_content.strip() or latest_content(conn, "generated_scripts", work_item_id)
+    script = ensure_verbose_playwright_logging(script)
     run = latest_run_for_work_item(work_item_id, item["latest_run_id"] or "")
     if not cases:
         raise HTTPException(status_code=400, detail="缺少测试用例，不能保存最终交付物")
@@ -7547,6 +9534,8 @@ def save_artifacts(work_item_id: str, payload: SaveArtifactsRequest) -> dict[str
     validate_script_covers_cases(cases, script)
     if run is None or run["status"] not in {"passed", "failed"}:
         raise HTTPException(status_code=400, detail="请先运行验证草稿脚本，并保留 Playwright HTML report 后再保存最终交付物")
+    if run["status"] != "passed":
+        raise HTTPException(status_code=400, detail="草稿脚本验证失败，不能发布替换绑定或保存最终交付物")
 
     delivery_dir = project_deliverable_dir(project["slug"], item["slug"])
     delivery_dir.mkdir(parents=True, exist_ok=True)
@@ -7560,17 +9549,45 @@ def save_artifacts(work_item_id: str, payload: SaveArtifactsRequest) -> dict[str
 
     relative_spec = relative_or_absolute(spec_path)
     with get_db() as conn:
-        case_ids = sync_test_cases_from_markdown(conn, project_id, work_item_id, cases, relative_spec, default_feature_id=feature_id)
-        for case_id in case_ids:
-            conn.execute(
-                """
-                UPDATE test_cases
-                SET automation_status = 'automated', spec_path = ?, latest_run_id = ?,
-                    latest_status = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (relative_spec, run["id"], run["status"], now_iso(), case_id),
-            )
+        asset_mode, stored_case_ids = work_item_asset_defaults(conn, item, payload.asset_mode, payload.case_ids)
+        case_ids = sync_test_cases_from_markdown(
+            conn,
+            project_id,
+            work_item_id,
+            cases,
+            "",
+            default_feature_id=feature_id,
+            asset_mode=asset_mode,
+            case_ids=stored_case_ids,
+        )
+        version_row = latest_script_version_for_work_item(conn, work_item_id)
+        if version_row is None or version_row["content_hash"] != content_hash(script):
+            script_version_id = create_script_version(conn, item, script, asset_mode=asset_mode, case_ids=case_ids)
+            version_row = conn.execute("SELECT * FROM test_script_versions WHERE id = ?", (script_version_id,)).fetchone()
+        else:
+            script_version_id = version_row["id"]
+        conn.execute(
+            """
+            UPDATE test_script_versions
+            SET spec_path = ?, content = ?, content_hash = ?, case_ids_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (relative_spec, script, content_hash(script), json_case_ids(case_ids), now_iso(), script_version_id),
+        )
+        publish_script_version(
+            conn,
+            item,
+            script_version_id,
+            case_ids,
+            cases,
+            script,
+            run,
+            source="published",
+        )
+        conn.execute(
+            "UPDATE work_items SET asset_mode = ?, case_ids_json = ?, updated_at = ? WHERE id = ?",
+            (asset_mode, json_case_ids(case_ids), now_iso(), work_item_id),
+        )
         register_deliverable(
             conn,
             project_id,
@@ -7580,6 +9597,7 @@ def save_artifacts(work_item_id: str, payload: SaveArtifactsRequest) -> dict[str
             work_item_id=work_item_id,
             run_id=run["id"],
             feature_id=feature_id,
+            case_id=case_ids[0] if len(case_ids) == 1 else "",
             status="ready",
             summary=summarize_content(cases, "已保存测试用例 Markdown。"),
         )
@@ -7592,6 +9610,7 @@ def save_artifacts(work_item_id: str, payload: SaveArtifactsRequest) -> dict[str
             work_item_id=work_item_id,
             run_id=run["id"],
             feature_id=feature_id,
+            case_id=case_ids[0] if len(case_ids) == 1 else "",
             status="ready",
             summary=summarize_content(script, "已保存 Playwright spec。"),
         )
@@ -7633,68 +9652,13 @@ def save_artifacts(work_item_id: str, payload: SaveArtifactsRequest) -> dict[str
 
 @app.post("/api/work-items/{work_item_id}/run")
 async def run_work_item(work_item_id: str) -> dict[str, Any]:
-    item = get_work_item_row(work_item_id)
-    script = latest_script_for_work_item(work_item_id)
-    if not script:
-        raise HTTPException(status_code=400, detail="请先生成或保存草稿 Playwright 脚本")
-    if "test(" not in script or "expect(" not in script:
-        raise HTTPException(status_code=400, detail="脚本基础校验失败：需要包含 test 和 expect")
-    with get_db() as conn:
-        case_rows = conn.execute(
-            "SELECT * FROM test_cases WHERE work_item_id = ? ORDER BY priority ASC, external_id ASC",
-            (work_item_id,),
-        ).fetchall()
-    relative_spec = write_draft_spec(item, script)
-    if case_rows:
-        with get_db() as conn:
-            for case_row in case_rows:
-                conn.execute(
-                    """
-                    UPDATE test_cases
-                    SET spec_path = ?, automation_status = 'automated', updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (relative_spec, now_iso(), case_row["id"]),
-                )
-    suite = {
-        "id": item["slug"],
-        "name": item["title"],
-        "spec": relative_spec,
-        "priority": "P0",
-        "cases": 1,
-        "description": item["requirement"],
-    }
-    run_id = uuid.uuid4().hex[:12]
     with get_db() as conn:
         active = conn.execute("SELECT id FROM runs WHERE status = 'running' LIMIT 1").fetchone()
         if active is not None:
             raise HTTPException(status_code=409, detail="Another test run is already running")
-        conn.execute(
-            """
-            INSERT INTO runs (
-                id, suite_id, suite_name, spec, status, stage_key, stage_label, progress,
-                started_at, report_path, screenshot_path, work_item_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                run_id,
-                suite["id"],
-                suite["name"],
-                suite["spec"],
-                "running",
-                "prepare",
-                "准备环境",
-                6,
-                now_iso(),
-                str(REPORT_INDEX),
-                str(SCREENSHOT_PATH),
-                work_item_id,
-            ),
-        )
-    update_work_item(work_item_id, stage="运行验证", status="running", latest_run_id=run_id)
-    write_log(run_id, "info", f"创建测试运行: {suite['name']}")
-    render_preview(run_id, "running", "准备环境", 6, [])
-    asyncio.create_task(run_playwright(run_id, suite, work_item_id))
+    run = await run_work_item_draft_once(work_item_id)
+    update_work_item(work_item_id, stage="运行验证", status=run["status"], latest_run_id=run["id"])
+    write_audit_log("work_item_run_started", "需求工单执行已启动", metadata={"workItemId": work_item_id, "runId": run["id"]})
     return get_work_item(work_item_id)
 
 
@@ -7731,6 +9695,7 @@ def self_heal(work_item_id: str, payload: HealRequest) -> dict[str, Any]:
 async def create_run(payload: RunRequest) -> dict[str, Any]:
     suite = find_suite(payload.suite_id)
     run_id = uuid.uuid4().hex[:12]
+    html_report = run_html_report_index(run_id)
     with get_db() as conn:
         active = conn.execute("SELECT id FROM runs WHERE status = 'running' LIMIT 1").fetchone()
         if active is not None:
@@ -7752,13 +9717,14 @@ async def create_run(payload: RunRequest) -> dict[str, Any]:
                 "准备环境",
                 6,
                 now_iso(),
-                str(REPORT_INDEX),
+                relative_or_absolute(html_report),
                 str(SCREENSHOT_PATH),
             ),
         )
     write_log(run_id, "info", f"创建测试运行: {suite['name']}")
     render_preview(run_id, "running", "准备环境", 6, [])
     asyncio.create_task(run_playwright(run_id, suite))
+    write_audit_log("suite_run_started", f"测试运行已启动：{suite['name']}", metadata={"runId": run_id, "suiteId": suite["id"]})
     return get_run(run_id)
 
 
@@ -7832,12 +9798,12 @@ def rendered_deliverable_report(deliverable_id: str):
         row = conn.execute("SELECT * FROM deliverables WHERE id = ?", (deliverable_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Deliverable not found")
-    if row["type"] == "html-report":
-        return RedirectResponse(url="/reports/playwright/", status_code=307)
 
     path = resolve_workspace_path(row["file_path"])
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail="Deliverable file not found")
+    if row["type"] == "html-report":
+        return report_file_redirect(path)
     if row["type"] == "manual-report" or path.suffix.lower() in {".md", ".markdown"}:
         with contextlib.suppress(UnicodeDecodeError, OSError):
             content = path.read_text(encoding="utf-8")
@@ -7857,23 +9823,35 @@ def rendered_report_file(path: str):
         raise HTTPException(status_code=404, detail="Report file not found")
     if not resolved.exists() or not resolved.is_file():
         raise HTTPException(status_code=404, detail="Report file not found")
-    normalized_name = resolved.name.lower()
-    normalized_path = str(resolved.relative_to(ROOT_DIR.resolve())).lower()
-    is_report_path = (
-        normalized_name.endswith(("-report.md", "-test-report.md", "index.html"))
-        or "failure-report.md" in normalized_path
-        or normalized_path.startswith("playwright-report/")
-    )
-    if not is_report_path:
+    if not is_report_file_path(resolved):
         raise HTTPException(status_code=404, detail="Report file not found")
     if resolved == REPORT_INDEX.resolve():
         return RedirectResponse(url="/reports/playwright/", status_code=307)
+    if resolved.suffix.lower() == ".html":
+        return report_file_redirect(resolved)
     if resolved.suffix.lower() in {".md", ".markdown"}:
         with contextlib.suppress(UnicodeDecodeError, OSError):
             content = resolved.read_text(encoding="utf-8")
             return HTMLResponse(rendered_report_page(resolved.name, render_markdown_report(content)))
         raise HTTPException(status_code=415, detail="Report file cannot be rendered")
     return FileResponse(resolved)
+
+
+@app.get("/reports/files/{asset_path:path}")
+def report_file_asset(asset_path: str) -> FileResponse:
+    normalized_asset = asset_path.strip("/")
+    if not normalized_asset:
+        raise HTTPException(status_code=404, detail="Report file not found")
+    path = safe_child_path(ROOT_DIR, normalized_asset)
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Report file not found")
+    try:
+        path.relative_to(ROOT_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Report file not found")
+    if not is_report_file_path(path):
+        raise HTTPException(status_code=404, detail="Report file not found")
+    return FileResponse(path)
 
 
 @app.get("/api/report")

@@ -34,6 +34,12 @@ class FakeStream:
 
 
 class BrowserRuntimeEventTests(unittest.IsolatedAsyncioTestCase):
+    def create_project(self, name: str = "单元测试项目"):
+        return main.create_project(main.ProjectRequest(name=name, project_type="product", status="active"))
+
+    def create_feature(self, project_id: str, name: str = "默认功能"):
+        return main.create_feature_menu(main.FeatureMenuRequest(project_id=project_id, name=name))
+
     def test_rewrite_spec_import_for_live_plain_playwright_test(self):
         source = "import { expect, test } from '@playwright/test';\n\ntest('ok', async ({ page }) => {});"
 
@@ -178,6 +184,12 @@ class BrowserRuntimeEventTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProjectCaseDeliverableTests(unittest.IsolatedAsyncioTestCase):
+    def create_project(self, name: str = "单元测试项目"):
+        return main.create_project(main.ProjectRequest(name=name, project_type="product", status="active"))
+
+    def create_feature(self, project_id: str, name: str = "默认功能"):
+        return main.create_feature_menu(main.FeatureMenuRequest(project_id=project_id, name=name))
+
     async def test_rendered_report_page_keeps_fenced_command_readable(self):
         command = "npx playwright test tests/e2e/.draft-runs/saucedemo-ad3d90.draft.spec.ts --project=chromium --reporter=list,html"
         body = main.render_markdown_report(f"""## 执行命令
@@ -211,6 +223,17 @@ class ProjectCaseDeliverableTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cases[0]["priority"], "P0")
         self.assertEqual(cases[0]["expected"], "进入商品页")
 
+    async def test_parse_cases_markdown_cleans_markdown_wrapped_case_ids(self):
+        markdown = """| ID | 优先级 | 标题 |
+| --- | --- | --- |
+| TC-SAUCEDEMO-4246A6-**TC001** | P0 | **登录成功** |
+"""
+
+        cases = main.parse_cases_markdown(markdown)
+
+        self.assertEqual(cases[0]["external_id"], "TC-SAUCEDEMO-4246A6-TC001")
+        self.assertEqual(cases[0]["title"], "登录成功")
+
     async def test_script_case_coverage_reports_missing_external_ids(self):
         cases = """| ID | 优先级 | 标题 |
 | --- | --- | --- |
@@ -223,24 +246,45 @@ class ProjectCaseDeliverableTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(missing, ["LGN-002"])
 
+    async def test_script_case_coverage_uses_cleaned_case_ids(self):
+        cases = """| ID | 优先级 | 标题 |
+| --- | --- | --- |
+| TC-SAUCEDEMO-4246A6-**TC001** | P0 | 登录成功 |
+| TC-SAUCEDEMO-4246A6-**TC002** | P0 | 加入购物车 |
+"""
+        script = """import { test, expect } from '@playwright/test';
+test('TC-SAUCEDEMO-4246A6-TC001 登录成功', async () => { expect(true).toBeTruthy(); });
+test('TC-SAUCEDEMO-4246A6-TC002 加入购物车', async () => { expect(true).toBeTruthy(); });
+"""
+
+        missing = main.missing_case_ids_in_script(cases, script)
+
+        self.assertEqual(missing, [])
+
     async def test_execution_config_allows_artifact_specs_to_be_collected(self):
         original_execution_config_dir = main.EXECUTION_CONFIG_DIR
         original_report_index = main.REPORT_INDEX
+        original_report_archive_dir = main.PLAYWRIGHT_REPORT_ARCHIVE_DIR
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             main.EXECUTION_CONFIG_DIR = main.ROOT_DIR / "tests" / "e2e" / ".execution-configs" / "unit-test"
             main.REPORT_INDEX = root / "playwright-report" / "index.html"
+            main.PLAYWRIGHT_REPORT_ARCHIVE_DIR = root / "artifacts" / "automation-platform" / "playwright-reports"
             try:
-                config_path = main.write_execution_playwright_config("run-config-001")
+                html_report = main.run_html_report_index("run-config-001")
+                blob_dir = main.suite_blob_report_dir("suite-config-001")
+                config_path = main.write_execution_playwright_config("run-config-001", html_report, blob_dir)
                 config_content = (main.ROOT_DIR / config_path).read_text(encoding="utf-8")
 
                 self.assertIn(f"testDir: {json.dumps(str(main.ROOT_DIR))}", config_content)
-                self.assertIn("outputFolder", config_content)
+                self.assertIn(f"outputFolder: {json.dumps(str(html_report.parent))}", config_content)
+                self.assertIn(f"outputDir: {json.dumps(str(blob_dir))}", config_content)
                 self.assertTrue(config_path.endswith("playwright.config.ts"))
             finally:
                 shutil.rmtree(main.EXECUTION_CONFIG_DIR, ignore_errors=True)
                 main.EXECUTION_CONFIG_DIR = original_execution_config_dir
                 main.REPORT_INDEX = original_report_index
+                main.PLAYWRIGHT_REPORT_ARCHIVE_DIR = original_report_archive_dir
 
     async def test_zzpss_default_script_uses_lgn_case_ids(self):
         original_db_path = main.DB_PATH
@@ -248,10 +292,12 @@ class ProjectCaseDeliverableTests(unittest.IsolatedAsyncioTestCase):
             main.DB_PATH = Path(directory) / "test.sqlite"
             try:
                 main.init_db()
-                project = main.projects()[0]
+                project = self.create_project()
+                feature = self.create_feature(project["id"], "登录功能")
                 work = main.create_work_item(
                     main.WorkItemRequest(
                         project_id=project["id"],
+                        feature_id=feature["id"],
                         requirement="验证 192.168.7.180:12222/zzpss 登录功能，账号 lining，密码 Hlkj@zzgdgs。",
                         target_url="http://192.168.7.180:12222/zzpss/#/login",
                         test_data="username=lining\npassword=Hlkj@zzgdgs",
@@ -265,21 +311,181 @@ class ProjectCaseDeliverableTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 main.DB_PATH = original_db_path
 
+    async def test_default_scripts_include_verbose_step_logging(self):
+        original_db_path = main.DB_PATH
+        with tempfile.TemporaryDirectory() as directory:
+            main.DB_PATH = Path(directory) / "test.sqlite"
+            try:
+                main.init_db()
+                project = self.create_project()
+                feature = self.create_feature(project["id"], "步骤日志")
+                zzpss_work = main.create_work_item(
+                    main.WorkItemRequest(
+                        project_id=project["id"],
+                        feature_id=feature["id"],
+                        requirement="验证 ZZPSS 登录，账号 lining，密码 Hlkj@zzgdgs。",
+                        target_url="http://192.168.7.180:12222/zzpss/#/login",
+                        test_data="username=lining\npassword=Hlkj@zzgdgs",
+                    )
+                )
+                sauce_work = main.create_work_item(
+                    main.WorkItemRequest(
+                        project_id=project["id"],
+                        feature_id=feature["id"],
+                        requirement="验证 standard_user 可以登录 Sauce Demo 并加购。",
+                        target_url="https://www.saucedemo.com",
+                        test_data="username=standard_user\npassword=secret_sauce",
+                    )
+                )
+                generic_work = main.create_work_item(
+                    main.WorkItemRequest(
+                        project_id=project["id"],
+                        feature_id=feature["id"],
+                        requirement="验证首页关键元素可见。",
+                        target_url="https://example.test",
+                    )
+                )
+                generic_element = {
+                    "area": "首页",
+                    "name": "欢迎",
+                    "locator_type": "text",
+                    "locator_value": "欢迎",
+                    "source": "unit",
+                }
+
+                scripts = [
+                    main.default_script(main.get_work_item_row(zzpss_work["id"]), []),
+                    main.default_script(main.get_work_item_row(sauce_work["id"]), []),
+                    main.default_script(main.get_work_item_row(generic_work["id"]), [generic_element]),
+                ]
+
+                for script in scripts:
+                    self.assertIn("[步骤开始]", script)
+                    self.assertIn("[步骤通过]", script)
+                    self.assertIn("[步骤失败]", script)
+                    self.assertIn("test.step", script)
+                    self.assertTrue(main.script_has_verbose_logging(script))
+            finally:
+                main.DB_PATH = original_db_path
+
+    async def test_script_generation_prompts_require_verbose_step_logging(self):
+        original_db_path = main.DB_PATH
+        with tempfile.TemporaryDirectory() as directory:
+            main.DB_PATH = Path(directory) / "test.sqlite"
+            try:
+                main.init_db()
+                project = self.create_project()
+                feature = self.create_feature(project["id"], "提示词日志")
+                work = main.create_work_item(
+                    main.WorkItemRequest(
+                        project_id=project["id"],
+                        feature_id=feature["id"],
+                        requirement="验证登录页可以提交账号密码。",
+                        target_url="https://example.test/login",
+                    )
+                )
+                item = main.get_work_item_row(work["id"])
+                elements = [
+                    {
+                        "area": "登录页",
+                        "name": "登录",
+                        "locator_type": "role",
+                        "locator_value": "登录",
+                        "source": "unit",
+                    }
+                ]
+                run = {
+                    "spec": "tests/e2e/.draft-runs/unit.spec.ts",
+                }
+
+                script_prompt = main.playwright_script_prompt(item, elements, "| ID | 优先级 | 标题 |\n| --- | --- | --- |\n| TC-001 | P0 | 登录 |\n")
+                healed_prompt = main.healed_script_prompt(item, "import { test, expect } from '@playwright/test';", run, "Locator: page.getByText('登录')", elements)
+
+                for prompt in [script_prompt, healed_prompt]:
+                    self.assertIn("[步骤开始]", prompt)
+                    self.assertIn("[步骤通过]", prompt)
+                    self.assertIn("[步骤失败]", prompt)
+                    self.assertIn("test.step", prompt)
+                    self.assertIn("console.log", prompt)
+            finally:
+                main.DB_PATH = original_db_path
+
+    async def test_generate_script_persists_verbose_logging_for_manual_content(self):
+        original_db_path = main.DB_PATH
+        original_draft_dir = main.WORK_ITEM_DRAFT_DIR
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            main.DB_PATH = root / "test.sqlite"
+            main.WORK_ITEM_DRAFT_DIR = root / "tests" / "e2e" / ".draft-runs"
+            try:
+                main.init_db()
+                project = self.create_project()
+                feature = self.create_feature(project["id"], "保存脚本日志")
+                work = main.create_work_item(
+                    main.WorkItemRequest(
+                        project_id=project["id"],
+                        feature_id=feature["id"],
+                        requirement="验证登录按钮可见。",
+                        target_url="https://example.test/login",
+                    )
+                )
+                cases = """| ID | 优先级 | 标题 | 覆盖需求 | 前置条件/测试数据 | 步骤 | 期望结果 | 自动化说明 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| TC-LOG-001 | P0 | 登录按钮可见 | 登录 | 打开登录页 | 查看登录按钮 | 按钮可见 | 已自动化 |
+"""
+                main.generate_cases(work["id"], main.ContentRequest(content=cases))
+                main.save_exploration(
+                    work["id"],
+                    main.ExplorationRequest(
+                        notes="确认登录按钮",
+                        elements=[
+                            {
+                                "area": "登录页",
+                                "name": "登录按钮",
+                                "locatorType": "text",
+                                "locatorValue": "登录",
+                                "source": "unit",
+                                "confirmed": True,
+                            }
+                        ],
+                    ),
+                )
+                script = """import { test, expect } from '@playwright/test';
+
+test('TC-LOG-001 登录按钮可见', async ({ page }) => {
+  await page.goto('https://example.test/login');
+  await expect(page.getByText('登录')).toBeVisible();
+});
+"""
+
+                item = main.generate_script(work["id"], main.ContentRequest(content=script))
+
+                self.assertIn("[步骤开始]", item["scriptContent"])
+                self.assertIn("[步骤通过]", item["scriptContent"])
+                self.assertIn("[步骤失败]", item["scriptContent"])
+                self.assertIn("test.beforeEach", item["scriptContent"])
+                self.assertIn("test.step", item["scriptContent"])
+            finally:
+                main.DB_PATH = original_db_path
+                main.WORK_ITEM_DRAFT_DIR = original_draft_dir
+
     async def test_default_report_includes_audit_detail_and_coverage_matrix(self):
         original_db_path = main.DB_PATH
         original_report_index = main.REPORT_INDEX
         original_screenshot_path = main.SCREENSHOT_PATH
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             main.DB_PATH = root / "test.sqlite"
             main.REPORT_INDEX = root / "playwright-report" / "index.html"
             main.SCREENSHOT_PATH = root / "artifacts" / "browser-preview.svg"
             try:
                 main.init_db()
-                project = main.projects()[0]
+                project = self.create_project()
+                feature = self.create_feature(project["id"], "登录审计")
                 work = main.create_work_item(
                     main.WorkItemRequest(
                         project_id=project["id"],
+                        feature_id=feature["id"],
                         requirement="验证 standard_user 可以登录 Sauce Demo 并看到商品页。",
                         target_url="https://www.saucedemo.com",
                         role="standard_user",
@@ -355,10 +561,12 @@ class ProjectCaseDeliverableTests(unittest.IsolatedAsyncioTestCase):
             main.SCREENSHOT_PATH = root / "artifacts" / "browser-preview.svg"
             try:
                 main.init_db()
-                project = main.projects()[0]
+                project = self.create_project()
+                feature = self.create_feature(project["id"], "失败报告")
                 work = main.create_work_item(
                     main.WorkItemRequest(
                         project_id=project["id"],
+                        feature_id=feature["id"],
                         requirement="验证登录失败时展示错误信息。",
                         target_url="https://www.saucedemo.com",
                     )
@@ -494,19 +702,47 @@ test('ok', async ({ page }) => {
             main.DB_PATH = Path(directory) / "test.sqlite"
             try:
                 main.init_db()
-                project = main.projects()[0]
+                project = self.create_project()
+                feature = self.create_feature(project["id"], "标题生成")
                 requirement = (
                     "验证标准用户可以在 https://www.saucedemo.com 登录、添加商品到购物车、进入结账流程，"
                     "并在错误账号或缺失信息时展示明确错误。角色为 standard_user，测试数据为用户名 "
                     "standard_user、密码 secret_sauce、商品 Sauce Labs Backpack。不覆盖跨浏览器兼容、支付真实链路和第三方风控。"
                 )
 
-                work = main.create_work_item(main.WorkItemRequest(project_id=project["id"], requirement=requirement))
+                work = main.create_work_item(main.WorkItemRequest(project_id=project["id"], feature_id=feature["id"], requirement=requirement))
 
                 self.assertNotEqual(work["title"], requirement[:80])
                 self.assertLessEqual(len(work["title"]), 28)
                 self.assertIn("验证", work["title"])
                 self.assertRegex(work["slug"], r"^saucedemo-[0-9a-f]{6}$")
+            finally:
+                main.DB_PATH = original_db_path
+
+    async def test_work_item_creation_requires_feature_binding(self):
+        original_db_path = main.DB_PATH
+        with tempfile.TemporaryDirectory() as directory:
+            main.DB_PATH = Path(directory) / "test.sqlite"
+            try:
+                main.init_db()
+                project = self.create_project()
+                feature = self.create_feature(project["id"], "需求工单绑定")
+
+                with self.assertRaises(main.HTTPException) as missing_feature:
+                    main.create_work_item(main.WorkItemRequest(project_id=project["id"], requirement="验证需求工单必须选择功能。"))
+                self.assertEqual(missing_feature.exception.status_code, 400)
+
+                work = main.create_work_item(
+                    main.WorkItemRequest(
+                        project_id=project["id"],
+                        feature_id=feature["id"],
+                        requirement="验证需求工单可以绑定项目与功能。",
+                    )
+                )
+
+                self.assertEqual(work["projectId"], project["id"])
+                self.assertEqual(work["featureId"], feature["id"])
+                self.assertEqual(work["featurePath"], feature["path"])
             finally:
                 main.DB_PATH = original_db_path
 
@@ -516,10 +752,11 @@ test('ok', async ({ page }) => {
             main.DB_PATH = Path(directory) / "test.sqlite"
             try:
                 main.init_db()
-                project = main.projects()[0]
+                project = self.create_project()
+                feature = self.create_feature(project["id"], "标题生成")
                 requirement = "供电所首页登录与菜单可见性：验证用户登录后首页菜单、指标卡片和欢迎语可见。测试数据为账号 lining。"
 
-                work = main.create_work_item(main.WorkItemRequest(project_id=project["id"], requirement=requirement))
+                work = main.create_work_item(main.WorkItemRequest(project_id=project["id"], feature_id=feature["id"], requirement=requirement))
 
                 self.assertEqual(work["title"], "供电所首页登录与菜单可见性验证")
             finally:
@@ -531,10 +768,11 @@ test('ok', async ({ page }) => {
             main.DB_PATH = Path(directory) / "test.sqlite"
             try:
                 main.init_db()
-                project = main.projects()[0]
+                project = self.create_project()
+                feature = self.create_feature(project["id"], "英文登录")
                 requirement = "https://www.saucedemo.com login smoke: verify standard_user can login and see Products page."
 
-                work = main.create_work_item(main.WorkItemRequest(project_id=project["id"], requirement=requirement))
+                work = main.create_work_item(main.WorkItemRequest(project_id=project["id"], feature_id=feature["id"], requirement=requirement))
 
                 self.assertLessEqual(len(work["title"]), 28)
                 self.assertIn("Saucedemo", work["title"])
@@ -549,11 +787,13 @@ test('ok', async ({ page }) => {
             main.DB_PATH = Path(directory) / "test.sqlite"
             try:
                 main.init_db()
-                project = main.projects()[0]
+                project = self.create_project()
+                feature = self.create_feature(project["id"], "自定义标题")
 
                 work = main.create_work_item(
                     main.WorkItemRequest(
                         project_id=project["id"],
+                        feature_id=feature["id"],
                         title="自定义登录回归任务",
                         requirement="验证用户可以登录系统并看到首页。",
                     )
@@ -575,9 +815,10 @@ test('ok', async ({ page }) => {
             main.REPORT_INDEX = root / "playwright-report" / "index.html"
             try:
                 main.init_db()
-                project = main.projects()[0]
+                project = self.create_project()
+                feature = self.create_feature(project["id"], "交付命名")
                 requirement = "供电所首页登录与菜单可见性：验证用户登录后首页菜单、指标卡片和欢迎语可见。测试数据为账号 lining。"
-                work = main.create_work_item(main.WorkItemRequest(project_id=project["id"], requirement=requirement))
+                work = main.create_work_item(main.WorkItemRequest(project_id=project["id"], feature_id=feature["id"], requirement=requirement))
                 cases = """| ID | 优先级 | 标题 | 覆盖需求 | 前置条件/测试数据 | 步骤 | 期望结果 | 自动化说明 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | TC-NAME-001 | P0 | 首页登录成功 | 首页登录 | lining | 登录后查看首页 | 菜单和欢迎语可见 | 已自动化 |
@@ -654,10 +895,12 @@ test('ok', async ({ page }) => {
             main.REPORT_INDEX = root / "playwright-report" / "index.html"
             try:
                 main.init_db()
-                project = main.projects()[0]
+                project = self.create_project()
+                feature = self.create_feature(project["id"], "脚本覆盖校验")
                 work = main.create_work_item(
                     main.WorkItemRequest(
                         project_id=project["id"],
+                        feature_id=feature["id"],
                         requirement="验证登录功能。",
                     )
                 )
@@ -729,10 +972,12 @@ test('ok', async ({ page }) => {
             main.DB_PATH = Path(directory) / "test.sqlite"
             try:
                 main.init_db()
-                project = main.projects()[0]
+                project = self.create_project()
+                feature = self.create_feature(project["id"], "套件跳过")
                 work = main.create_work_item(
                     main.WorkItemRequest(
                         project_id=project["id"],
+                        feature_id=feature["id"],
                         requirement="验证用户可以在 https://www.saucedemo.com 登录，测试数据为 standard_user/secret_sauce，验收标准为进入商品页。",
                     )
                 )
@@ -741,7 +986,7 @@ test('ok', async ({ page }) => {
 | TC-SMOKE-001 | P0 | 登录成功 | 登录 | standard_user/secret_sauce | 打开页面并登录 | 进入商品页 | 待自动化 |
 """
                 main.generate_cases(work["id"], main.ContentRequest(content=markdown))
-                cases = [case for case in main.test_cases(project_id=project["id"]) if case["externalId"] == "TC-SMOKE-001"]
+                cases = [case for case in main.test_cases(project_id=project["id"]) if case["workItemId"] == work["id"]]
 
                 suite_run = await main.create_suite_run(main.SuiteRunRequest(case_ids=[cases[0]["id"]]))
                 await asyncio.sleep(0.2)
@@ -753,16 +998,188 @@ test('ok', async ({ page }) => {
             finally:
                 main.DB_PATH = original_db_path
 
+    async def test_suite_run_keeps_per_case_reports_and_sets_suite_report_path(self):
+        original_db_path = main.DB_PATH
+        original_report_archive_dir = main.PLAYWRIGHT_REPORT_ARCHIVE_DIR
+        original_report_index = main.REPORT_INDEX
+        original_root_dir = main.ROOT_DIR
+        original_execution_config_dir = main.EXECUTION_CONFIG_DIR
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            main.DB_PATH = root / "test.sqlite"
+            main.PLAYWRIGHT_REPORT_ARCHIVE_DIR = root / "artifacts" / "automation-platform" / "playwright-reports"
+            main.REPORT_INDEX = root / "playwright-report" / "index.html"
+            main.ROOT_DIR = root
+            main.EXECUTION_CONFIG_DIR = root / "tests" / "e2e" / ".execution-configs"
+            try:
+                main.init_db()
+                project = self.create_project()
+                spec_path = root / "tests" / "e2e" / "suite-report.spec.ts"
+                spec_path.parent.mkdir(parents=True, exist_ok=True)
+                spec_path.write_text("import { test, expect } from '@playwright/test';\n", encoding="utf-8")
+                case_one = main.create_test_case(
+                    main.TestCaseRequest(
+                        project_id=project["id"],
+                        external_id="TC-SUITE-REPORT-001",
+                        title="套件报告用例一",
+                        priority="P0",
+                        automation_status="automated",
+                        spec_path=str(spec_path.relative_to(root)),
+                    )
+                )
+                case_two = main.create_test_case(
+                    main.TestCaseRequest(
+                        project_id=project["id"],
+                        external_id="TC-SUITE-REPORT-002",
+                        title="套件报告用例二",
+                        priority="P1",
+                        automation_status="automated",
+                        spec_path=str(spec_path.relative_to(root)),
+                    )
+                )
+                suite = main.create_test_suite(main.SuiteRequest(project_id=project["id"], name="套件报告回归"))
+                main.update_test_suite_cases(suite["id"], main.SuiteCaseUpdateRequest(case_ids=[case_one["id"], case_two["id"]]))
+                suite_report = main.suite_html_report_index("placeholder")
+
+                async def fake_run_playwright(run_id, suite_payload, work_item_id=None):
+                    report_path = Path(suite_payload["html_report_path"])
+                    report_path.parent.mkdir(parents=True, exist_ok=True)
+                    report_path.write_text(f"<html>{run_id}</html>", encoding="utf-8")
+                    with main.get_db() as conn:
+                        conn.execute(
+                            "UPDATE runs SET status = 'passed', ended_at = ?, exit_code = 0, report_path = ? WHERE id = ?",
+                            (main.now_iso(), main.relative_or_absolute(report_path), run_id),
+                        )
+
+                async def fake_merge_suite_html_report(suite_run_id):
+                    report_path = main.suite_html_report_index(suite_run_id)
+                    report_path.parent.mkdir(parents=True, exist_ok=True)
+                    report_path.write_text("<html>suite</html>", encoding="utf-8")
+                    return report_path
+
+                with (
+                    patch.object(main, "run_playwright", side_effect=fake_run_playwright),
+                    patch.object(main, "merge_suite_html_report", side_effect=fake_merge_suite_html_report),
+                ):
+                    suite_run = await main.create_suite_run(main.SuiteRunRequest(suite_id=suite["id"]))
+                    await asyncio.sleep(0.2)
+
+                detail = main.get_suite_run(suite_run["id"])
+                run_ids = [item["runId"] for item in detail["cases"]]
+                run_report_paths = []
+                with main.get_db() as conn:
+                    for run_id in run_ids:
+                        row = conn.execute("SELECT report_path FROM runs WHERE id = ?", (run_id,)).fetchone()
+                        run_report_paths.append(row["report_path"])
+
+                expected_suite_report = main.relative_or_absolute(main.suite_html_report_index(suite_run["id"]))
+                self.assertEqual(detail["status"], "passed")
+                self.assertEqual(detail["reportPath"], expected_suite_report)
+                self.assertEqual(len(set(run_report_paths)), 2)
+                self.assertTrue(all("/artifacts/automation-platform/playwright-reports/runs/" in path for path in run_report_paths))
+                self.assertTrue(all(path.endswith("/index.html") for path in run_report_paths))
+                self.assertNotIn(detail["reportPath"], run_report_paths)
+                self.assertNotEqual(detail["reportPath"], main.relative_or_absolute(main.REPORT_INDEX))
+                self.assertNotEqual(main.relative_or_absolute(suite_report), detail["reportPath"])
+            finally:
+                main.DB_PATH = original_db_path
+                main.PLAYWRIGHT_REPORT_ARCHIVE_DIR = original_report_archive_dir
+                main.REPORT_INDEX = original_report_index
+                main.ROOT_DIR = original_root_dir
+                main.EXECUTION_CONFIG_DIR = original_execution_config_dir
+
+    async def test_delete_test_cases_removes_suite_links_but_keeps_history_and_deliverables(self):
+        original_db_path = main.DB_PATH
+        with tempfile.TemporaryDirectory() as directory:
+            main.DB_PATH = Path(directory) / "test.sqlite"
+            try:
+                main.init_db()
+                project = self.create_project()
+                case_one = main.create_test_case(
+                    main.TestCaseRequest(
+                        project_id=project["id"],
+                        external_id="TC-DELETE-001",
+                        title="单条删除用例",
+                        priority="P0",
+                    )
+                )
+                case_two = main.create_test_case(
+                    main.TestCaseRequest(
+                        project_id=project["id"],
+                        external_id="TC-DELETE-002",
+                        title="批量删除用例",
+                        priority="P1",
+                    )
+                )
+                suite = main.create_test_suite(main.SuiteRequest(project_id=project["id"], name="删除回归套件"))
+                main.update_test_suite_cases(suite["id"], main.SuiteCaseUpdateRequest(case_ids=[case_one["id"], case_two["id"]]))
+                artifact_path = Path(directory) / "delete-case-report.md"
+                artifact_path.write_text("保留交付物登记", encoding="utf-8")
+                timestamp = main.now_iso()
+                with main.get_db() as conn:
+                    main.register_deliverable(
+                        conn,
+                        project["id"],
+                        "manual-report",
+                        "删除回归交付物",
+                        artifact_path,
+                        case_id=case_one["id"],
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO suite_runs (
+                            id, suite_id, project_id, name, status, progress, total_cases,
+                            passed_cases, failed_cases, skipped_cases, started_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        ("suite-run-delete", suite["id"], project["id"], suite["name"], "queued", 0, 1, 0, 0, 0, timestamp),
+                    )
+                    conn.execute(
+                        "INSERT INTO suite_run_cases (suite_run_id, case_id, status) VALUES (?, ?, ?)",
+                        ("suite-run-delete", case_one["id"], "queued"),
+                    )
+
+                deleted = main.delete_test_case(case_one["id"])
+                suite_after_single_delete = main.get_test_suite(suite["id"])
+                remaining_cases = main.test_cases(project_id=project["id"])
+                with main.get_db() as conn:
+                    linked_deliverables = conn.execute("SELECT COUNT(*) AS total FROM deliverables WHERE case_id = ?", (case_one["id"],)).fetchone()["total"]
+                    historical_run_cases = conn.execute("SELECT COUNT(*) AS total FROM suite_run_cases WHERE case_id = ?", (case_one["id"],)).fetchone()["total"]
+
+                self.assertEqual(deleted["deleted"], 1)
+                self.assertNotIn(case_one["id"], {case["id"] for case in remaining_cases})
+                self.assertEqual(suite_after_single_delete["caseIds"], [case_two["id"]])
+                self.assertEqual(linked_deliverables, 1)
+                self.assertEqual(historical_run_cases, 1)
+
+                with self.assertRaises(main.HTTPException) as empty_raised:
+                    main.bulk_delete_test_cases(main.TestCaseBulkDeleteRequest(case_ids=[]))
+                self.assertEqual(empty_raised.exception.status_code, 400)
+
+                with self.assertRaises(main.HTTPException) as invalid_raised:
+                    main.bulk_delete_test_cases(main.TestCaseBulkDeleteRequest(case_ids=[case_two["id"], "missing-case-id"]))
+                self.assertEqual(invalid_raised.exception.status_code, 404)
+                self.assertTrue(any(case["id"] == case_two["id"] for case in main.test_cases(project_id=project["id"])))
+
+                bulk_deleted = main.bulk_delete_test_cases(main.TestCaseBulkDeleteRequest(case_ids=[case_two["id"], case_two["id"]]))
+                self.assertEqual(bulk_deleted["deleted"], 1)
+                self.assertEqual(bulk_deleted["ids"], [case_two["id"]])
+                self.assertFalse(main.get_test_suite(suite["id"])["caseIds"])
+            finally:
+                main.DB_PATH = original_db_path
+
     async def test_delivery_report_returns_case_rows_including_cases_without_deliverables(self):
         original_db_path = main.DB_PATH
         with tempfile.TemporaryDirectory() as directory:
             main.DB_PATH = Path(directory) / "test.sqlite"
             try:
                 main.init_db()
-                project = main.projects()[0]
+                project = self.create_project()
+                feature = self.create_feature(project["id"], "交付报告")
                 work = main.create_work_item(
                     main.WorkItemRequest(
                         project_id=project["id"],
+                        feature_id=feature["id"],
                         requirement="验证交付报告按用例展示，并包含尚未生成交付物的测试用例。",
                     )
                 )
@@ -772,7 +1189,7 @@ test('ok', async ({ page }) => {
 | TC-REPORT-002 | P1 | 无交付物用例 | 报表 | 已登录 | 打开报表 | 展示待生成 | 待自动化 |
 """
                 main.generate_cases(work["id"], main.ContentRequest(content=markdown))
-                case_rows = [case for case in main.test_cases(project_id=project["id"]) if case["externalId"].startswith("TC-REPORT-")]
+                case_rows = [case for case in main.test_cases(project_id=project["id"]) if case["workItemId"] == work["id"]]
                 self.assertEqual(len(case_rows), 2)
                 artifact_path = Path(directory) / "report-cases.md"
                 artifact_path.write_text(markdown, encoding="utf-8")
@@ -789,12 +1206,12 @@ test('ok', async ({ page }) => {
                         summary="TC-REPORT-001 交付物",
                     )
 
-                report = main.delivery_report(q="TC-REPORT", page_size=20)
-                returned_ids = {item["case"]["externalId"] for item in report["items"]}
+                report = main.delivery_report(work_item_id=work["id"], page_size=20)
+                returned_titles = {item["case"]["title"] for item in report["items"]}
 
                 self.assertEqual(report["total"], 2)
-                self.assertEqual(returned_ids, {"TC-REPORT-001", "TC-REPORT-002"})
-                empty_case = next(item for item in report["items"] if item["case"]["externalId"] == "TC-REPORT-002")
+                self.assertEqual(returned_titles, {"有交付物用例", "无交付物用例"})
+                empty_case = next(item for item in report["items"] if item["case"]["title"] == "无交付物用例")
                 self.assertFalse(empty_case["deliverableSummary"])
             finally:
                 main.DB_PATH = original_db_path
@@ -805,10 +1222,12 @@ test('ok', async ({ page }) => {
             main.DB_PATH = Path(directory) / "test.sqlite"
             try:
                 main.init_db()
-                project = main.projects()[0]
+                project = self.create_project()
+                feature = self.create_feature(project["id"], "交付筛选")
                 work = main.create_work_item(
                     main.WorkItemRequest(
                         project_id=project["id"],
+                        feature_id=feature["id"],
                         requirement="验证交付物类型筛选只返回已经绑定对应交付物的用例。",
                     )
                 )
@@ -818,7 +1237,7 @@ test('ok', async ({ page }) => {
 | TC-REPORT-TYPE-002 | P1 | 类型筛选未命中 | 报表 | 已登录 | 查询脚本 | 不返回未命中项 | 待自动化 |
 """
                 main.generate_cases(work["id"], main.ContentRequest(content=markdown))
-                case_rows = {case["externalId"]: case for case in main.test_cases(project_id=project["id"]) if case["externalId"].startswith("TC-REPORT-TYPE-")}
+                case_rows = {case["title"]: case for case in main.test_cases(project_id=project["id"]) if case["workItemId"] == work["id"]}
                 spec_path = Path(directory) / "report-type.spec.ts"
                 spec_path.write_text("import { test, expect } from '@playwright/test';\n", encoding="utf-8")
                 with main.get_db() as conn:
@@ -829,7 +1248,7 @@ test('ok', async ({ page }) => {
                         "类型筛选脚本交付物",
                         spec_path,
                         work_item_id=work["id"],
-                        case_id=case_rows["TC-REPORT-TYPE-001"]["id"],
+                        case_id=case_rows["类型筛选命中"]["id"],
                         status="ready",
                         summary="keyword-only-spec-deliverable",
                     )
@@ -837,10 +1256,123 @@ test('ok', async ({ page }) => {
                 report = main.delivery_report(q="keyword-only-spec", deliverable_type="spec", page_size=20)
 
                 self.assertEqual(report["total"], 1)
-                self.assertEqual(report["items"][0]["case"]["externalId"], "TC-REPORT-TYPE-001")
+                self.assertEqual(report["items"][0]["case"]["title"], "类型筛选命中")
                 self.assertIn("spec", report["items"][0]["deliverableSummary"])
             finally:
                 main.DB_PATH = original_db_path
+
+    async def test_delivery_report_summary_uses_full_filtered_result_not_page(self):
+        original_db_path = main.DB_PATH
+        with tempfile.TemporaryDirectory() as directory:
+            main.DB_PATH = Path(directory) / "test.sqlite"
+            try:
+                main.init_db()
+                project = self.create_project()
+                feature = self.create_feature(project["id"], "交付汇总")
+                work = main.create_work_item(
+                    main.WorkItemRequest(
+                        project_id=project["id"],
+                        feature_id=feature["id"],
+                        requirement="验证交付报告汇总不受分页影响。",
+                    )
+                )
+                markdown = """| ID | 优先级 | 标题 | 覆盖需求 | 前置条件/测试数据 | 步骤 | 期望结果 | 自动化说明 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| TC-SUMMARY-001 | P0 | 完整交付用例 | 报表 | 已登录 | 打开报表 | 展示交付物 | 待自动化 |
+| TC-SUMMARY-002 | P1 | 缺人工报告用例 | 报表 | 已登录 | 打开报表 | 展示缺失 | 待自动化 |
+| TC-SUMMARY-003 | P2 | 无交付物用例 | 报表 | 已登录 | 打开报表 | 展示缺失 | 待自动化 |
+"""
+                main.generate_cases(work["id"], main.ContentRequest(content=markdown))
+                case_rows = {case["title"]: case for case in main.test_cases(project_id=project["id"]) if case["workItemId"] == work["id"]}
+                complete_paths = {
+                    "test-cases": Path(directory) / "complete-test-cases.md",
+                    "spec": Path(directory) / "complete.spec.ts",
+                    "manual-report": Path(directory) / "complete-test-report.md",
+                    "html-report": Path(directory) / "complete-index.html",
+                }
+                missing_manual_paths = {
+                    "test-cases": Path(directory) / "missing-manual-test-cases.md",
+                    "spec": Path(directory) / "missing-manual.spec.ts",
+                    "html-report": Path(directory) / "missing-manual-index.html",
+                }
+                for deliverable_type, path in {**complete_paths, **missing_manual_paths}.items():
+                    path.write_text(markdown if deliverable_type == "test-cases" else deliverable_type, encoding="utf-8")
+                with main.get_db() as conn:
+                    for deliverable_type, path in complete_paths.items():
+                        main.register_deliverable(
+                            conn,
+                            project["id"],
+                            deliverable_type,
+                            f"完整交付 {deliverable_type}",
+                            path,
+                            work_item_id=work["id"],
+                            case_id=case_rows["完整交付用例"]["id"],
+                            status="ready",
+                        )
+                    for deliverable_type, path in missing_manual_paths.items():
+                        main.register_deliverable(
+                            conn,
+                            project["id"],
+                            deliverable_type,
+                            f"缺人工报告 {deliverable_type}",
+                            path,
+                            work_item_id=work["id"],
+                            case_id=case_rows["缺人工报告用例"]["id"],
+                            status="ready",
+                        )
+
+                report = main.delivery_report(work_item_id=work["id"], page=1, page_size=1)
+
+                self.assertEqual(report["total"], 3)
+                self.assertEqual(len(report["items"]), 1)
+                self.assertEqual(report["summary"]["total"], 3)
+                self.assertEqual(report["summary"]["ready"], 1)
+                self.assertEqual(report["summary"]["missing"], 2)
+                self.assertEqual(report["summary"]["failedRisk"], 0)
+                self.assertEqual(report["summary"]["missingByType"]["manual-report"], 2)
+                self.assertEqual(report["summary"]["missingByType"]["test-cases"], 1)
+                self.assertEqual(report["items"][0]["readiness"], "missing")
+            finally:
+                main.DB_PATH = original_db_path
+
+    async def test_html_report_deliverable_redirects_to_its_own_report_file(self):
+        original_db_path = main.DB_PATH
+        original_root_dir = main.ROOT_DIR
+        original_report_archive_dir = main.PLAYWRIGHT_REPORT_ARCHIVE_DIR
+        original_report_index = main.REPORT_INDEX
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            main.DB_PATH = root / "test.sqlite"
+            main.ROOT_DIR = root
+            main.PLAYWRIGHT_REPORT_ARCHIVE_DIR = root / "artifacts" / "automation-platform" / "playwright-reports"
+            main.REPORT_INDEX = root / "playwright-report" / "index.html"
+            try:
+                main.init_db()
+                project = self.create_project()
+                report_index = main.run_html_report_index("run-own-report")
+                report_index.parent.mkdir(parents=True, exist_ok=True)
+                report_index.write_text("<html>own report</html>", encoding="utf-8")
+                with main.get_db() as conn:
+                    deliverable_id = main.register_deliverable(
+                        conn,
+                        project["id"],
+                        "html-report",
+                        "独立 HTML Report",
+                        report_index,
+                        run_id="run-own-report",
+                    )
+
+                response = main.rendered_deliverable_report(deliverable_id)
+                expected_path = main.relative_or_absolute(report_index)
+
+                self.assertEqual(response.status_code, 307)
+                self.assertEqual(response.headers["location"], f"/reports/files/{expected_path}")
+                self.assertTrue(main.is_report_file_path(report_index.resolve()))
+            finally:
+                main.DB_PATH = original_db_path
+                main.ROOT_DIR = original_root_dir
+                main.PLAYWRIGHT_REPORT_ARCHIVE_DIR = original_report_archive_dir
+                main.REPORT_INDEX = original_report_index
 
     async def test_deliverables_can_expand_historical_spec_bound_case(self):
         original_db_path = main.DB_PATH
@@ -848,7 +1380,7 @@ test('ok', async ({ page }) => {
             main.DB_PATH = Path(directory) / "test.sqlite"
             try:
                 main.init_db()
-                project = main.projects()[0]
+                project = self.create_project()
                 spec_path = Path(directory) / "historical.spec.ts"
                 case_doc_path = Path(directory) / "historical-test-cases.md"
                 spec_path.write_text("import { test, expect } from '@playwright/test';\ntest('historical', async () => {});\n", encoding="utf-8")
@@ -872,11 +1404,7 @@ test('ok', async ({ page }) => {
             main.DB_PATH = Path(directory) / "test.sqlite"
             try:
                 main.init_db()
-                default_project = main.projects()[0]
-
-                self.assertEqual(default_project["projectCode"], main.DEFAULT_PROJECT_CODE)
-                self.assertEqual(default_project["projectType"], "product")
-                self.assertEqual(default_project["status"], "active")
+                self.assertEqual(main.projects(), [])
 
                 created = main.create_project(
                     main.ProjectRequest(
@@ -891,6 +1419,11 @@ test('ok', async ({ page }) => {
                 self.assertRegex(created["projectCode"], r"^PRJ-\d{8}-\d{3}$")
                 self.assertEqual(created["projectType"], "delivery")
                 self.assertEqual(created["status"], "planning")
+
+                linked_project = self.create_project("关联资产项目")
+                self.assertRegex(linked_project["projectCode"], r"^PRJ-\d{8}-\d{3}$")
+                self.assertEqual(linked_project["projectType"], "product")
+                self.assertEqual(linked_project["status"], "active")
 
                 updated = main.update_project(
                     created["id"],
@@ -919,23 +1452,226 @@ test('ok', async ({ page }) => {
                     main.update_project(created["id"], main.ProjectPatchRequest(status="deleted"))
                 self.assertEqual(invalid_status.exception.status_code, 400)
 
+                feature = self.create_feature(linked_project["id"], "项目删除保护")
                 work = main.create_work_item(
                     main.WorkItemRequest(
-                        project_id=default_project["id"],
-                        requirement="验证有关联需求工单的默认项目不能删除。",
+                        project_id=linked_project["id"],
+                        feature_id=feature["id"],
+                        requirement="验证有关联需求工单的项目不能删除。",
                     )
                 )
                 self.assertTrue(work["id"])
-                with self.assertRaises(main.HTTPException) as default_delete:
-                    main.delete_project(default_project["id"])
-                self.assertEqual(default_delete.exception.status_code, 400)
-                self.assertIn("默认项目不能删除", default_delete.exception.detail)
+                with self.assertRaises(main.HTTPException) as linked_delete:
+                    main.delete_project(linked_project["id"])
+                self.assertEqual(linked_delete.exception.status_code, 400)
+                self.assertIn("项目下仍有关联资产", linked_delete.exception.detail)
+
+                with main.get_db() as conn:
+                    timestamp = main.now_iso()
+                    conn.execute(
+                        """
+                        INSERT INTO projects (
+                            id, slug, project_code, name, project_type, status,
+                            target_url, repository_path, test_dir, description,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            main.DEFAULT_PROJECT_ID,
+                            "legacy-default",
+                            main.DEFAULT_PROJECT_CODE,
+                            "历史默认项目",
+                            "product",
+                            "active",
+                            "",
+                            "",
+                            "tests/e2e",
+                            "",
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+                legacy_deleted = main.delete_project(main.DEFAULT_PROJECT_ID)
+                self.assertEqual(legacy_deleted["status"], "deleted")
 
                 deleted = main.delete_project(created["id"])
                 self.assertEqual(deleted["status"], "deleted")
                 self.assertFalse(any(project["id"] == created["id"] for project in main.projects()))
             finally:
                 main.DB_PATH = original_db_path
+
+    async def test_project_scoped_writes_require_explicit_project(self):
+        original_db_path = main.DB_PATH
+        with tempfile.TemporaryDirectory() as directory:
+            main.DB_PATH = Path(directory) / "test.sqlite"
+            try:
+                main.init_db()
+                self.assertEqual(main.feature_menus(), {"items": [], "tree": []})
+                self.assertEqual(main.test_cases(), [])
+                self.assertEqual(main.test_suites(), [])
+                self.assertEqual(main.suite_runs(), [])
+
+                requests = [
+                    lambda: main.create_feature_menu(main.FeatureMenuRequest(name="缺少项目功能")),
+                    lambda: main.create_test_case(main.TestCaseRequest(title="缺少项目用例")),
+                    lambda: main.create_test_suite(main.SuiteRequest(name="缺少项目套件")),
+                    lambda: main.create_deliverable(main.DeliverableRequest(type="manual-report", name="缺少项目交付物", content="content")),
+                    lambda: main.create_work_item(main.WorkItemRequest(requirement="验证缺少项目时不能创建工单。")),
+                ]
+                for action in requests:
+                    with self.assertRaises(main.HTTPException) as missing_project:
+                        action()
+                    self.assertEqual(missing_project.exception.status_code, 400)
+                    self.assertIn("项目", missing_project.exception.detail)
+
+                with self.assertRaises(main.HTTPException) as missing_flow_project:
+                    await main.create_automation_flow(main.AutomationFlowRequest(requirement="验证缺少项目时不能启动全流程。"))
+                self.assertEqual(missing_flow_project.exception.status_code, 400)
+                self.assertIn("项目", missing_flow_project.exception.detail)
+            finally:
+                main.DB_PATH = original_db_path
+
+
+class AuthApiTests(unittest.TestCase):
+    def setUp(self):
+        self.original_db_path = main.DB_PATH
+        self.tempdir = tempfile.TemporaryDirectory()
+        main.DB_PATH = Path(self.tempdir.name) / "auth-test.sqlite"
+        main.init_db()
+        with main.get_db() as conn:
+            self.admin_row = conn.execute("SELECT * FROM users WHERE username = ?", ("admin",)).fetchone()
+
+    def tearDown(self):
+        main.DB_PATH = self.original_db_path
+        self.tempdir.cleanup()
+
+    def admin_request(self):
+        request = SimpleNamespace()
+        request.state = SimpleNamespace(user=main.row_to_user(self.admin_row))
+        return request
+
+    def test_default_admin_password_hash_verifies(self):
+        with main.get_db() as conn:
+            row = conn.execute("SELECT * FROM users WHERE username = ?", ("admin",)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["role"], "admin")
+        self.assertEqual(row["status"], "active")
+        self.assertTrue(main.verify_password("admin123456", row["password_hash"]))
+
+    def test_registration_requires_admin_approval_before_login(self):
+        registered = main.register(main.RegisterRequest(username="tester1", display_name="测试同学", password="abc12345"))
+        self.assertEqual(registered["status"], "pending")
+        with main.get_db() as conn:
+            row = conn.execute("SELECT * FROM users WHERE username = ?", ("tester1",)).fetchone()
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["role"], "viewer")
+        self.assertTrue(main.verify_password("abc12345", row["password_hash"]))
+
+    def test_admin_can_create_user_with_active_status(self):
+        created = main.create_user(
+            main.UserCreateRequest(
+                username="New.User",
+                display_name="新同学",
+                password="abc12345",
+                role="viewer",
+                status="active",
+            ),
+            self.admin_request(),
+        )
+
+        self.assertEqual(created["username"], "new.user")
+        self.assertEqual(created["displayName"], "新同学")
+        self.assertEqual(created["role"], "viewer")
+        self.assertEqual(created["status"], "active")
+        with main.get_db() as conn:
+            row = conn.execute("SELECT * FROM users WHERE id = ?", (created["id"],)).fetchone()
+        self.assertTrue(main.verify_password("abc12345", row["password_hash"]))
+
+    def test_admin_create_user_rejects_duplicate_username(self):
+        payload = main.UserCreateRequest(username="duplicate", password="abc12345")
+        main.create_user(payload, self.admin_request())
+
+        with self.assertRaises(main.HTTPException) as duplicate:
+            main.create_user(payload, self.admin_request())
+
+        self.assertEqual(duplicate.exception.status_code, 400)
+        self.assertIn("账号已存在", duplicate.exception.detail)
+
+    def test_admin_can_update_user_profile_role_and_status(self):
+        created = main.create_user(main.UserCreateRequest(username="editor1", password="abc12345"), self.admin_request())
+
+        updated = main.update_user(
+            created["id"],
+            main.UserPatchRequest(display_name="编辑后", role="executor", status="disabled"),
+            self.admin_request(),
+        )
+
+        self.assertEqual(updated["displayName"], "编辑后")
+        self.assertEqual(updated["role"], "executor")
+        self.assertEqual(updated["status"], "disabled")
+
+    def test_disabling_user_clears_sessions(self):
+        created = main.create_user(main.UserCreateRequest(username="session-user", password="abc12345"), self.admin_request())
+        main.create_session(created["id"])
+
+        main.update_user(created["id"], main.UserPatchRequest(status="disabled"), self.admin_request())
+
+        with main.get_db() as conn:
+            sessions = conn.execute("SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = ?", (created["id"],)).fetchone()
+        self.assertEqual(sessions["count"], 0)
+
+    def test_admin_can_delete_user_and_clear_sessions(self):
+        created = main.create_user(main.UserCreateRequest(username="delete-me", password="abc12345"), self.admin_request())
+        main.create_session(created["id"])
+
+        deleted = main.delete_user(created["id"], self.admin_request())
+
+        self.assertEqual(deleted, {"status": "deleted", "id": created["id"]})
+        with main.get_db() as conn:
+            user = conn.execute("SELECT * FROM users WHERE id = ?", (created["id"],)).fetchone()
+            sessions = conn.execute("SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = ?", (created["id"],)).fetchone()
+        self.assertIsNone(user)
+        self.assertEqual(sessions["count"], 0)
+
+    def test_default_admin_is_protected_from_dangerous_changes(self):
+        admin_id = self.admin_row["id"]
+
+        with self.assertRaises(main.HTTPException) as disabled:
+            main.update_user(admin_id, main.UserPatchRequest(status="disabled"), self.admin_request())
+        with self.assertRaises(main.HTTPException) as downgraded:
+            main.update_user(admin_id, main.UserPatchRequest(role="viewer"), self.admin_request())
+        with self.assertRaises(main.HTTPException) as deleted:
+            main.delete_user(admin_id, self.admin_request())
+
+        self.assertEqual(disabled.exception.status_code, 400)
+        self.assertEqual(downgraded.exception.status_code, 400)
+        self.assertEqual(deleted.exception.status_code, 400)
+
+    def test_permission_matrix_blocks_viewer_mutations_and_ai_secret(self):
+        self.assertEqual(main.path_permission("/api/projects", "POST"), {"admin", "lead"})
+        self.assertNotIn("viewer", main.path_permission("/api/projects", "POST"))
+        self.assertNotIn("executor", main.path_permission("/api/test-cases/bulk-delete", "POST"))
+        self.assertEqual(main.path_permission("/api/ai-config/profile-1/secret", "GET"), {"admin"})
+        self.assertIn("executor", main.path_permission("/api/work-items/abc/run", "POST"))
+        self.assertEqual(main.path_permission("/api/work-items/abc/save-artifacts", "POST"), {"admin", "lead"})
+
+    def test_auth_failure_response_includes_cors_for_allowed_origin(self):
+        request = main.Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/api/projects",
+            "headers": [(b"origin", b"http://127.0.0.1:5174")],
+        })
+
+        response = main.json_auth_response(request, {"detail": "请先登录"}, 401)
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.headers["access-control-allow-origin"], "http://127.0.0.1:5174")
+        self.assertEqual(response.headers["access-control-allow-credentials"], "true")
+        self.assertIn("Origin", response.headers["vary"])
+
+    def test_options_requests_are_allowed_without_auth_for_cors_preflight(self):
+        self.assertTrue(main.route_allowed_without_auth("/api/projects", "OPTIONS"))
 
 
 if __name__ == "__main__":

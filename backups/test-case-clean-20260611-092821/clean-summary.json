@@ -1,0 +1,40 @@
+{
+  "backup_dir": "backups/test-case-clean-20260611-092821",
+  "before": {
+    "test_cases": 93,
+    "test_suite_cases": 0,
+    "test_suites": 0,
+    "suite_run_cases": 0,
+    "suite_runs": 0,
+    "generated_cases": 0,
+    "deliverables_case_id_nonempty": 0
+  },
+  "after": {
+    "test_cases": 0,
+    "test_suite_cases": 0,
+    "test_suites": 0,
+    "suite_run_cases": 0,
+    "suite_runs": 0,
+    "generated_cases": 0,
+    "deliverables_case_id_nonempty": 0
+  },
+  "ai_settings_masked": [
+    {
+      "key": "openai_api_key",
+      "value_masked": "sk-************************************************************562c",
+      "updated_at": "2026-06-03T10:15:59.949400+00:00"
+    },
+    {
+      "key": "openai_base_url",
+      "value_masked": "htt*****************k/v1",
+      "updated_at": "2026-06-03T10:15:59.952099+00:00"
+    },
+    {
+      "key": "openai_model",
+      "value_masked": "*******",
+      "updated_at": "2026-06-03T10:15:59.951114+00:00"
+    }
+  ],
+  "integrity_check": "ok",
+  "sqlite_sequence_remaining": {}
+}

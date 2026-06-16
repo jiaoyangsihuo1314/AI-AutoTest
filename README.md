@@ -95,6 +95,14 @@ npm run dev:frontend
 http://127.0.0.1:5174
 ```
 
+默认管理员账号：
+
+```text
+admin / admin123456
+```
+
+新用户可在登录页申请注册，需管理员在 `用户管理` 中启用后才能登录。开发或自动化测试如需跳过鉴权，可在后端启动时设置 `QA_AUTH_DISABLED=1`。
+
 后端健康检查：
 
 ```bash
@@ -209,7 +217,7 @@ npm run dev:backend
 
 ## 注意事项
 
-- v1 是本地单用户平台，不做登录和多用户并发隔离。
+- 平台启用本地账号登录和角色权限；默认管理员为 `admin / admin123456`，开发或自动化测试可用 `QA_AUTH_DISABLED=1` 跳过鉴权。
 - 浏览器展示区使用 WebSocket + CDP Screencast，不使用截图轮询；证据截图只作为步骤归档。
 - 探索阶段会自动采集候选元素，但最终 selector 仍必须人工确认；没有测试用例或确认元素时不能生成最终脚本。
 - 最终交付物只在运行验证后写入仓库；草稿运行文件不会作为交付 spec。
@@ -229,6 +237,19 @@ npm run dev:backend
 ```bash
 cd /Users/syj/Documents/qa-project
 curl --noproxy '*' http://127.0.0.1:8001/api/health
+```
+
+如果健康检查成功，但后端日志里业务接口返回 `401 Unauthorized`，通常是未登录、登录态过期，或前端访问地址与后端允许的本地地址不一致。请用默认管理员账号重新登录：
+
+```text
+admin / admin123456
+```
+
+也可以在本地开发或自动化测试时临时跳过鉴权：
+
+```bash
+cd /Users/syj/Documents/qa-project
+QA_AUTH_DISABLED=1 npm run dev:backend
 ```
 
 如果连接失败，单独启动后端：
