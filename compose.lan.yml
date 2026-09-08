@@ -1,0 +1,6 @@
+services:
+  app:
+    environment:
+      QA_AUTH_COOKIE_SECURE: "0"
+    ports:
+      - ${APP_PORT:-8001}:8001

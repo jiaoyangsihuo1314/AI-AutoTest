@@ -7,6 +7,8 @@
     "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
     "dev:frontend": "npm --prefix frontend run dev",
     "dev:backend": ".venv/bin/python -m uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8001",
+    "build:lan": "npm --prefix frontend run build",
+    "start:lan": ".venv/bin/python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8001 --workers 1",
     "test:e2e": "playwright test",
     "test:e2e:headed": "playwright test --headed",
     "test:e2e:report": "playwright show-report"
@@ -14,6 +16,7 @@
   "devDependencies": {
     "@playwright/test": "1.60.0",
     "concurrently": "^9.2.1",
-    "playwright": "1.60.0"
+    "playwright": "1.60.0",
+    "typescript": "^5.9.3"
   }
 }

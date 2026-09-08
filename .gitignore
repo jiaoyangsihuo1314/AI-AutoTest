@@ -11,6 +11,8 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+*.sqlite-shm
+*.sqlite-wal
 downloads/
 eggs/
 .eggs/
@@ -226,3 +228,5 @@ test-results/
 artifacts/
 tests/e2e/.live-runs/
 tests/e2e/.draft-runs/
+.env.docker
+docker-data/

@@ -1,0 +1,47 @@
+services:
+  app:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ai-autotest:${IMAGE_TAG:-local}
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    init: true
+    ipc: host
+    restart: unless-stopped
+    stop_grace_period: 60s
+    environment:
+      QA_DB_PATH: /data/automation-platform.sqlite
+      QA_SECRET_KEY_PATH: /app/artifacts/automation-platform/.secret-key
+      QA_LOG_LEVEL: ${QA_LOG_LEVEL:-INFO}
+      QA_MAX_ACTIVE_BROWSER_SESSIONS: ${QA_MAX_ACTIVE_BROWSER_SESSIONS:-3}
+      QA_EXPLORATION_PLAN_TIMEOUT_SECONDS: ${QA_EXPLORATION_PLAN_TIMEOUT_SECONDS:-120}
+      QA_BOOTSTRAP_ADMIN_PASSWORD: ${QA_BOOTSTRAP_ADMIN_PASSWORD:-}
+      QA_TEST_RESET_ENABLED: "0"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+    expose:
+      - "8001"
+    volumes:
+      - ${DOCKER_DATA_DIR:-./docker-data}/db:/data
+      - ${DOCKER_DATA_DIR:-./docker-data}/artifacts:/app/artifacts
+      - ${DOCKER_DATA_DIR:-./docker-data}/playwright-report:/app/playwright-report
+      - ${DOCKER_DATA_DIR:-./docker-data}/test-results:/app/test-results
+      - ${DOCKER_DATA_DIR:-./docker-data}/draft-runs:/app/tests/e2e/.draft-runs
+      - ${DOCKER_DATA_DIR:-./docker-data}/live-runs:/app/tests/e2e/.live-runs
+      - ${DOCKER_DATA_DIR:-./docker-data}/execution-configs:/app/tests/e2e/.execution-configs
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8001/api/health', timeout=5).read()"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
